@@ -46,6 +46,18 @@ testlogs
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml
 
+# Local Hermes runtime/config state — never publish personal config, auth, sessions, or memory
+config.yaml
+auth.json
+sessions/
+.hermes/
+profiles/
+memory/
+credentials.json
+token.json
+*.key
+*.token
+
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
 ignored/
