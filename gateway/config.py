@@ -862,6 +862,14 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if plat == Platform.DISCORD and "channel_text_batch_delays" in platform_cfg:
+                    _ctbd = platform_cfg["channel_text_batch_delays"]
+                    if isinstance(_ctbd, dict):
+                        bridged["channel_text_batch_delays"] = {str(k): v for k, v in _ctbd.items()}
+                if plat == Platform.DISCORD and "channel_text_batch_split_delays" in platform_cfg:
+                    _ctbsd = platform_cfg["channel_text_batch_split_delays"]
+                    if isinstance(_ctbsd, dict):
+                        bridged["channel_text_batch_split_delays"] = {str(k): v for k, v in _ctbsd.items()}
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):

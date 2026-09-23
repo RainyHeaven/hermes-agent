@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import struct
 import subprocess
@@ -574,6 +575,10 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
 
+    # Upper bound for per-channel text batch delays; anything larger would
+    # stall the channel for minutes and is treated as a config mistake.
+    _MAX_CHANNEL_BATCH_DELAY_SECONDS = 300.0
+
     # Auto-disconnect from voice channel after this many seconds of inactivity
     VOICE_TIMEOUT = 300
 
@@ -590,6 +595,25 @@ class DiscordAdapter(BasePlatformAdapter):
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", "0.6"))
         self._text_batch_split_delay_seconds = float(os.getenv("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", "2.0"))
+        # Per-channel overrides: channel_id (str) -> delay (float seconds)
+        self._channel_text_batch_delays: Dict[str, float] = {}
+        self._channel_text_batch_split_delays: Dict[str, float] = {}
+        for _raw_map, _target in [
+            (config.extra.get("channel_text_batch_delays", {}), self._channel_text_batch_delays),
+            (config.extra.get("channel_text_batch_split_delays", {}), self._channel_text_batch_split_delays),
+        ]:
+            if isinstance(_raw_map, dict):
+                for _ch_id, _val in _raw_map.items():
+                    _delay = self._coerce_channel_batch_delay(_val)
+                    if _delay is None:
+                        logger.warning(
+                            "[Discord] Invalid channel text batch delay for channel %s: %r "
+                            "(expected a finite number between 0 and %s seconds) — ignoring "
+                            "the override and using the global default",
+                            _ch_id, _val, self._MAX_CHANNEL_BATCH_DELAY_SECONDS,
+                        )
+                        continue
+                    _target[str(_ch_id)] = _delay
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
@@ -4891,6 +4915,54 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+    @classmethod
+    def _coerce_channel_batch_delay(cls, value: Any) -> Optional[float]:
+        """Coerce a configured per-channel batch delay into a safe float.
+
+        Returns None (caller warns and falls back to the global default) for
+        anything that isn't a finite number within
+        [0, _MAX_CHANNEL_BATCH_DELAY_SECONDS].  Bools are rejected explicitly
+        because ``bool`` is an ``int`` subclass and would otherwise become
+        0.0/1.0 seconds.
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            delay = float(value)
+        elif isinstance(value, str):
+            try:
+                delay = float(value.strip())
+            except (TypeError, ValueError):
+                return None
+        else:
+            return None
+        if not math.isfinite(delay):
+            return None
+        if delay < 0.0 or delay > cls._MAX_CHANNEL_BATCH_DELAY_SECONDS:
+            return None
+        return delay
+
+    def _resolve_channel_delay(
+        self,
+        event: Optional[MessageEvent],
+        *,
+        delays: Dict[str, float],
+        default: float,
+    ) -> float:
+        """Return the per-channel delay for *event*, falling back to *default*.
+
+        Prefers an exact match on chat_id; if not found, tries parent_chat_id
+        (for threads whose parent channel has a configured delay).
+        """
+        if event is not None:
+            ch = event.source.chat_id
+            parent = event.source.parent_chat_id
+            if ch and ch in delays:
+                return delays[ch]
+            if parent and parent in delays:
+                return delays[parent]
+        return default
+
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
 
@@ -4930,9 +5002,17 @@ class DiscordAdapter(BasePlatformAdapter):
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
             if last_len >= self._SPLIT_THRESHOLD:
-                delay = self._text_batch_split_delay_seconds
+                delay = self._resolve_channel_delay(
+                    pending,
+                    delays=self._channel_text_batch_split_delays,
+                    default=self._text_batch_split_delay_seconds,
+                )
             else:
-                delay = self._text_batch_delay_seconds
+                delay = self._resolve_channel_delay(
+                    pending,
+                    delays=self._channel_text_batch_delays,
+                    default=self._text_batch_delay_seconds,
+                )
             await asyncio.sleep(delay)
             event = self._pending_text_batches.pop(key, None)
             if not event:
