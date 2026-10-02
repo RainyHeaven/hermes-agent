@@ -14,13 +14,23 @@ Selection precedence for the tier (first hit wins):
 3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
 
+The host chat model that calls the ``image_generation`` tool is resolved at
+runtime from the raw authenticated Codex ``/models`` catalog (see
+:func:`_resolve_host_models`). ``image_gen.openai-codex.host_model`` in
+``config.yaml`` pins a specific host, but only when that slug is present in
+the account's raw catalog.
+
 Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
+import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -70,15 +80,40 @@ _SIZES = {
     "portrait": "1024x1536",
 }
 
-# Codex Responses surface used for the request. The chat model itself is only
-# the host that calls the ``image_generation`` tool; the actual image work is
-# done by ``API_MODEL``.
-_CODEX_CHAT_MODEL = "gpt-5.4"
+# Codex Responses surface used for the request. The chat model is only the
+# host that calls the ``image_generation`` tool; the actual image work is done
+# by ``API_MODEL``. The host is discovered per account because the Codex
+# backend rejects slugs outside the account's lineup with HTTP 400.
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+_CODEX_MODELS_URL = f"{_CODEX_BASE_URL}/models?client_version=1.0.0"
 _CODEX_INSTRUCTIONS = (
     "You are an assistant that must fulfill image generation requests by "
     "using the image_generation tool when provided."
 )
+
+# Mainline host slugs look like ``gpt-6``, ``gpt-5.5`` or ``gpt-6-sol``.
+# Specialised variants (codex / mini / nano / pro / spark / multi-suffix) are
+# skipped — they are not general-purpose tool hosts.
+_MAINLINE_HOST_RE = re.compile(r"^gpt-\d+(?:\.\d+)*(?:-([a-z0-9]+))?$")
+_NON_MAINLINE_SUFFIXES = frozenset({"codex", "mini", "nano", "pro", "spark", "oss"})
+_MAX_HOST_ATTEMPTS = 3
+
+# In-process cache of the raw /models catalog, keyed by a token digest so the
+# OAuth token itself is never held as a key. Failures are never cached.
+_HOST_MODEL_CACHE_TTL = 600.0
+_HOST_MODEL_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+
+
+class CodexHostModelError(RuntimeError):
+    """No usable Codex host model could be determined for image generation."""
+
+
+class CodexHostModelRejected(RuntimeError):
+    """The Codex backend refused the chosen host model for this account."""
+
+    def __init__(self, host_model: str, detail: str) -> None:
+        super().__init__(f"Codex rejected host model '{host_model}': {detail}")
+        self.host_model = host_model
 
 
 # ---------------------------------------------------------------------------
@@ -143,10 +178,141 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Host model discovery
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_PRIORITY_RANK = 10_000
+
+
+def _priority_rank(priority: Any) -> int:
+    """Map a /models ``priority`` to a sort rank; unusable values sort last."""
+    if isinstance(priority, bool):
+        return _DEFAULT_PRIORITY_RANK
+    if isinstance(priority, int):
+        return priority
+    if isinstance(priority, float) and math.isfinite(priority):
+        return int(priority)
+    return _DEFAULT_PRIORITY_RANK
+
+
+def _fetch_raw_codex_models(token: str) -> List[str]:
+    """Return visible slugs from the raw authenticated Codex ``/models`` catalog.
+
+    Deliberately bypasses ``hermes_cli.codex_models``: that helper appends
+    synthetic forward-compat slugs and hardcoded fallbacks the account may not
+    be able to use. Raises :class:`CodexHostModelError` on any failure.
+    """
+    import httpx
+    from agent.auxiliary_client import _codex_cloudflare_headers
+
+    headers = _codex_cloudflare_headers(token)
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        resp = httpx.get(_CODEX_MODELS_URL, headers=headers, timeout=15.0)
+    except Exception as exc:
+        # Only the exception type: the message (and chained traceback) can
+        # echo request headers, including the bearer token.
+        raise CodexHostModelError(
+            f"Codex /models request failed: {type(exc).__name__}"
+        ) from None
+    if resp.status_code != 200:
+        raise CodexHostModelError(f"Codex /models returned HTTP {resp.status_code}")
+    try:
+        data = resp.json()
+    except Exception as exc:
+        raise CodexHostModelError("Codex /models returned a non-JSON body") from exc
+    entries = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise CodexHostModelError("Codex /models response has no 'models' list")
+
+    sortable: List[Tuple[int, str]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        visibility = item.get("visibility")
+        if isinstance(visibility, str) and visibility.strip().lower() in {"hide", "hidden"}:
+            continue
+        sortable.append((_priority_rank(item.get("priority")), slug.strip()))
+
+    sortable.sort(key=lambda entry: (entry[0], entry[1]))
+    slugs: List[str] = []
+    for _, slug in sortable:
+        if slug not in slugs:
+            slugs.append(slug)
+    return slugs
+
+
+def _cached_raw_codex_models(token: str) -> List[str]:
+    """:func:`_fetch_raw_codex_models` with a short per-token in-process cache."""
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    hit = _HOST_MODEL_CACHE.get(key)
+    if hit and now - hit[0] < _HOST_MODEL_CACHE_TTL:
+        return list(hit[1])
+    slugs = _fetch_raw_codex_models(token)
+    if slugs:
+        _HOST_MODEL_CACHE[key] = (now, list(slugs))
+    return slugs
+
+
+def _rank_host_models(slugs: List[str]) -> List[str]:
+    """Keep mainline host candidates, preserving the backend's priority order."""
+    ranked: List[str] = []
+    for slug in slugs:
+        match = _MAINLINE_HOST_RE.match(slug)
+        if match and match.group(1) not in _NON_MAINLINE_SUFFIXES and slug not in ranked:
+            ranked.append(slug)
+    return ranked
+
+
+def _configured_host_model() -> Optional[str]:
+    sub = _load_image_gen_config().get("openai-codex")
+    value = sub.get("host_model") if isinstance(sub, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _resolve_host_models(token: str) -> List[str]:
+    """Return host model candidates (best first) for this Codex account.
+
+    A configured ``image_gen.openai-codex.host_model`` is honoured only when
+    the raw catalog lists it. Raises :class:`CodexHostModelError` instead of
+    guessing a hardcoded slug when discovery fails or finds nothing usable.
+    """
+    slugs = _cached_raw_codex_models(token)
+    if not slugs:
+        raise CodexHostModelError("Codex /models returned no models for this account")
+
+    override = _configured_host_model()
+    if override:
+        if override in slugs:
+            return [override]
+        raise CodexHostModelError(
+            f"Configured image_gen.openai-codex.host_model '{override}' is not in "
+            f"this account's Codex model list: {', '.join(slugs)}"
+        )
+
+    ranked = _rank_host_models(slugs)
+    if not ranked:
+        raise CodexHostModelError(
+            "No mainline Codex host model found in this account's model list "
+            f"({', '.join(slugs)}); set image_gen.openai-codex.host_model to one of them"
+        )
+    return ranked
+
+
+def _build_responses_payload(
+    *, prompt: str, size: str, quality: str, host_model: str
+) -> Dict[str, Any]:
     """Build the Codex Responses request body for an image_generation call."""
     return {
-        "model": _CODEX_CHAT_MODEL,
+        "model": host_model,
         "store": False,
         "instructions": _CODEX_INSTRUCTIONS,
         "input": [{
@@ -242,7 +408,9 @@ def _iter_sse_json(response: Any):
         yield payload
 
 
-def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _collect_image_b64(
+    token: str, *, prompt: str, size: str, quality: str, host_model: str
+) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     import httpx
     from agent.auxiliary_client import _codex_cloudflare_headers
@@ -253,7 +421,9 @@ def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> O
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     })
-    payload = _build_responses_payload(prompt=prompt, size=size, quality=quality)
+    payload = _build_responses_payload(
+        prompt=prompt, size=size, quality=quality, host_model=host_model
+    )
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
@@ -264,6 +434,8 @@ def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> O
             except httpx.HTTPStatusError as exc:
                 exc.response.read()
                 body = exc.response.text[:500]
+                if exc.response.status_code == 400 and "not supported" in body.lower():
+                    raise CodexHostModelRejected(host_model, body[:200]) from exc
                 raise RuntimeError(
                     f"Codex Responses API returned HTTP {exc.response.status_code}: {body}"
                 ) from exc
@@ -383,12 +555,47 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             )
 
         try:
-            b64 = _collect_image_b64(
-                token,
+            host_models = _resolve_host_models(token)
+        except CodexHostModelError as exc:
+            return error_response(
+                error=f"Could not select a Codex host model for image generation: {exc}",
+                error_type="host_model_unavailable",
+                provider="openai-codex",
+                model=tier_id,
                 prompt=prompt,
-                size=size,
-                quality=meta["quality"],
+                aspect_ratio=aspect,
             )
+
+        b64: Optional[str] = None
+        host_model = host_models[0]
+        rejected: List[str] = []
+        try:
+            for host_model in host_models[:_MAX_HOST_ATTEMPTS]:
+                try:
+                    b64 = _collect_image_b64(
+                        token,
+                        prompt=prompt,
+                        size=size,
+                        quality=meta["quality"],
+                        host_model=host_model,
+                    )
+                    break
+                except CodexHostModelRejected:
+                    logger.info("Codex rejected image host model %s; trying next", host_model)
+                    rejected.append(host_model)
+            else:
+                return error_response(
+                    error=(
+                        "Codex rejected every candidate host model for image "
+                        f"generation ({', '.join(rejected)}); set "
+                        "image_gen.openai-codex.host_model to a supported model"
+                    ),
+                    error_type="host_model_unavailable",
+                    provider="openai-codex",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
             return error_response(
@@ -428,7 +635,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="openai-codex",
-            extra={"size": size, "quality": meta["quality"]},
+            extra={"size": size, "quality": meta["quality"], "host_model": host_model},
         )
 
 
