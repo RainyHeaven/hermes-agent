@@ -85,6 +85,85 @@ _CHAIN_CAP = 1000
 # carries them onto the child (per-segment keys such as usage anchors stay behind).
 _CONVERSATION_MODEL_CONFIG_KEYS = ("onboarding_run",)
 
+# Committed full compactions of this conversation. Written only inside the compaction's own transaction
+# (archive_and_compact / publish_compression_child), carried by rotation, read by compression.rollover_after.
+FULL_COMPACTION_COUNT_KEY = "_full_compaction_count"
+# Ledger stand-in written when the stored model_config itself is unreadable: a rewrite of that row (merge,
+# compaction, wholesale meta, rotation) must not turn unknown durable state into a trustworthy zero.
+_UNREADABLE_LEDGER = {"unreadable_model_config": True}
+# Context-rollover transition records (hermes_state_rollover): the claim on a source session, the origin on
+# its fresh target. Written only by that module's compare-and-set transactions; kept like the ledger.
+ROLLOVER_CLAIM_KEY = "_context_rollover"
+ROLLOVER_ORIGIN_KEY = "_context_rollover_origin"
+_TRANSITION_KEYS = (ROLLOVER_CLAIM_KEY, ROLLOVER_ORIGIN_KEY)
+
+
+def strict_model_config(raw: Any) -> dict[str, Any]:
+    """Strict ``model_config`` decode for the ledger: SQL NULL / blank (legacy) -> {}, a JSON object -> dict
+    copy; anything else (malformed JSON, ``null``, arrays, scalars) raises ValueError."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        parsed = json.loads(raw) if isinstance(raw, (str, bytes)) else None
+    except ValueError:
+        raise ValueError("stored model_config is not valid JSON") from None
+    if not isinstance(parsed, dict):
+        raise ValueError("stored model_config is not a JSON object")
+    return parsed
+
+
+def _stored_full_compaction_count(raw: Any) -> tuple[bool, Any]:
+    """``(present, value)`` of the ledger in a stored model_config; unreadable config -> the stand-in.
+    A stored JSON ``null`` is corrupt too, and becomes the stand-in because a merge reads ``None`` as delete."""
+    try:
+        config = strict_model_config(raw)
+    except ValueError:
+        return True, dict(_UNREADABLE_LEDGER)
+    if FULL_COMPACTION_COUNT_KEY not in config:
+        return False, None
+    value = config[FULL_COMPACTION_COUNT_KEY]
+    return True, dict(_UNREADABLE_LEDGER) if value is None else value
+
+
+def _next_full_compaction_count(value: Any) -> Any:
+    """The ledger value after one more committed full compaction. A corrupt value is left as-is so the
+    compaction still commits and the rollover readback fails closed instead of restarting at 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return value
+    return value + 1
+
+
+def _keep_full_compaction_count(stored: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """*config* (about to replace *stored*) with the stored ledger value and rollover transition records in
+    place of whatever the writer sent: a stale snapshot can neither reset the count nor erase/forge a claim."""
+    config.pop(FULL_COMPACTION_COUNT_KEY, None)
+    present, value = _stored_full_compaction_count(stored)
+    if present:
+        config[FULL_COMPACTION_COUNT_KEY] = value
+    try:
+        stored_config = strict_model_config(stored)
+    except ValueError:
+        stored_config = {}  # the ledger stand-in above already makes every rollover read fail closed
+    for key in _TRANSITION_KEYS:
+        config.pop(key, None)
+        if key in stored_config:
+            config[key] = stored_config[key]
+    return config
+
+
+def _keep_full_compaction_count_json(stored: Any, model_config_json: str) -> str:
+    """JSON form of :func:`_keep_full_compaction_count` for wholesale writers; a non-object payload is
+    the writer's own and stays as sent (the readback then fails closed rather than reading zero)."""
+    try:
+        config = json.loads(model_config_json) if model_config_json else {}
+    except (json.JSONDecodeError, TypeError):
+        return model_config_json
+    if not isinstance(config, dict):
+        return model_config_json
+    return json.dumps(_keep_full_compaction_count(stored, config))
+
 
 def _walk_compression_chain(session_id: str, step) -> list[str]:
     """Root-first ids from *session_id* through its tip; ``step(id)`` returns the ``_CHAIN_STEP_SQL`` row."""
@@ -236,15 +315,29 @@ class SessionCompressionMixin:
             return updated.rowcount == 1
         return bool(self._execute_write(_do))
 
+    def _full_compaction_count_patch(self, conn, session_id: str) -> dict[str, Any]:
+        """In-txn model_config patch recording one more committed full compaction ({} without a row)."""
+        row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            return {}
+        present, value = _stored_full_compaction_count(row[0])
+        return {FULL_COMPACTION_COUNT_KEY: _next_full_compaction_count(value if present else 0)}
+
     def _publish_child_session_row(self, conn, parent, *, parent_session_id, child_session_id, source,
-                                   model, model_config, system_prompt, cwd, profile_name) -> None:
+                                   model, model_config, system_prompt, cwd, profile_name,
+                                   count_full_compaction: bool = False) -> None:
         """INSERT the compression child's ``sessions`` row copied from *parent*. Same contract as
         _insert_session_row's compression-fork backfill: the child stays on the parent's profile and keeps
         gateway routing/origin columns; no owner on either side -> this store's profile."""
         from hermes_state_sessions import _parse_model_config
-        carried = {key: value for key, value in _parse_model_config(parent["model_config"]).items()
-                   if key in _CONVERSATION_MODEL_CONFIG_KEYS}
-        model_config = {**carried, **(model_config or {})}
+        parent_config = _parse_model_config(parent["model_config"])
+        carried = {key: value for key, value in parent_config.items() if key in _CONVERSATION_MODEL_CONFIG_KEYS}
+        # The ledger continues the parent's, never the caller's (an agent's init config may hold a stale copy);
+        # an unreadable parent config carries the unreadable stand-in, not a fresh zero.
+        model_config = _keep_full_compaction_count(parent["model_config"], {**carried, **(model_config or {})})
+        if count_full_compaction:
+            model_config[FULL_COMPACTION_COUNT_KEY] = _next_full_compaction_count(
+                model_config.get(FULL_COMPACTION_COUNT_KEY, 0))
         system_prompt_hash = self._store_system_prompt(conn, system_prompt)
         # The child continues the parent's tools[] pin (the compaction refresh re-pinned it just
         # before publish), or its first hop to another surface re-derives the array.
@@ -277,10 +370,12 @@ class SessionCompressionMixin:
         system_prompt: str | None = None, cwd: str | None = None, profile_name: str | None = None,
         compression_lock_holder: str | None = None, require_compression_lease: bool = True,
         require_lease_refresh: bool = False, lease_ttl_seconds: float = 300.0,
-        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
+        watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None,
+        count_full_compaction: bool = False) -> None:
         """Atomically close a parent and publish its durable compression child: closure, child row, and
         handoff commit in one transaction, so readers see the live parent or a complete child, never an
-        ended parent with a missing/empty child. *watermark* (the parent's highest row already represented
+        ended parent with a missing/empty child. The child continues the parent's full-compaction ledger,
+        advanced by one when *count_full_compaction* (a committed full compaction). *watermark* (the parent's highest row already represented
         in the handoff: its ``get_active_message_watermark`` at compression start, or the newest row of an
         adopted durable snapshot): parent rows with ``id > watermark`` — appends landed during the slow
         summary — are column-cloned into the child AFTER the handoff. *watermark_ceiling* bounds the clone:
@@ -332,7 +427,7 @@ class SessionCompressionMixin:
             self._publish_child_session_row(
                 conn, parent, parent_session_id=parent_session_id, child_session_id=child_session_id,
                 source=source, model=model, model_config=model_config, system_prompt=system_prompt,
-                cwd=cwd, profile_name=profile_name)
+                cwd=cwd, profile_name=profile_name, count_full_compaction=count_full_compaction)
             # Carried handoff tail rows arrive without a timestamp and would otherwise be stamped
             # `now`, breaking their _display_dedupe_key identity with the parent's durable originals
             # and duplicating them in the lineage display read (#59661).

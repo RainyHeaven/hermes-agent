@@ -643,42 +643,9 @@ class CLIAgentSetupMixin:
                 if single_query_mode
                 else self._clarify_callback)
             connection_callback = None if single_query_mode else self._connection_callback
-            self.agent = AIAgent(
-                model=effective_model, api_key=runtime.get("api_key"),
-                base_url=runtime.get("base_url"), provider=runtime.get("provider"),
-                requested_provider=runtime.get("requested_provider"),
-                api_mode=runtime.get("api_mode"), acp_command=runtime.get("command"),
-                acp_args=runtime.get("args"), credential_pool=runtime.get("credential_pool"),
-                max_iterations=self.max_turns,
-                run_budget_seconds=getattr(self, "run_budget_seconds", None),
-                enabled_toolsets=self.enabled_toolsets, disabled_toolsets=self.disabled_toolsets,
-                verbose_logging=self.verbose, quiet_mode=not self.verbose,
-                tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
-                ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
-                prefill_messages=self.prefill_messages or None,
-                reasoning_config=self.reasoning_config, service_tier=self.service_tier,
-                request_overrides=request_overrides, providers_allowed=self._providers_only,
-                providers_ignored=self._providers_ignore, providers_order=self._providers_order,
-                provider_sort=self._provider_sort,
-                provider_require_parameters=self._provider_require_params,
-                provider_data_collection=self._provider_data_collection,
-                openrouter_min_coding_score=self._openrouter_min_coding_score,
-                session_id=self.session_id, platform="cli", session_db=self._session_db,
-                clarify_callback=clarify_callback, connection_callback=connection_callback,
-                reasoning_callback=self._current_reasoning_callback(),
-                fallback_model=self._fallback_model, thinking_callback=self._on_thinking,
-                checkpoints_enabled=self.checkpoints_enabled,
-                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
-                checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
-                pass_session_id=self.pass_session_id, skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules, tool_progress_callback=self._on_tool_progress,
-                tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
-                tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
-                stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
-                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
-                notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
-                reaction_callback=self._on_reaction)
+            self.agent = AIAgent(**self._agent_build_kwargs(
+                effective_model, runtime, request_overrides, clarify_callback=clarify_callback,
+                connection_callback=connection_callback))
             # Reference for atexit memory-provider shutdown: ``_run_cleanup`` in cli.py
             # reads ``cli._active_agent_ref``, so this MUST write the ``cli`` module's
             # global — a ``global`` statement here would bind this module's namespace.
@@ -727,6 +694,52 @@ class CLIAgentSetupMixin:
             for line in partial_update_hint(e):
                 console.print(line)
             return False
+
+    def _agent_build_kwargs(self, effective_model, runtime: dict, request_overrides, *, clarify_callback=None,
+                            connection_callback=None) -> dict:
+        """``AIAgent`` constructor kwargs for this CLI session (``_init_agent`` and the context-rollover
+        factory build through the same set, so a fresh agent gets the same callbacks and settings)."""
+        if clarify_callback is None:
+            clarify_callback = (_single_query_clarify_callback if getattr(self, "_single_query_mode", False)
+                                else self._clarify_callback)
+        if connection_callback is None and not getattr(self, "_single_query_mode", False):
+            connection_callback = self._connection_callback
+        return dict(
+            model=effective_model, api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"), provider=runtime.get("provider"),
+            requested_provider=runtime.get("requested_provider"),
+            api_mode=runtime.get("api_mode"), acp_command=runtime.get("command"),
+            acp_args=runtime.get("args"), credential_pool=runtime.get("credential_pool"),
+            max_iterations=self.max_turns,
+            run_budget_seconds=getattr(self, "run_budget_seconds", None),
+            enabled_toolsets=self.enabled_toolsets, disabled_toolsets=self.disabled_toolsets,
+            verbose_logging=self.verbose, quiet_mode=not self.verbose,
+            tool_progress_mode=getattr(self, "tool_progress_mode", "all"),
+            ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
+            prefill_messages=self.prefill_messages or None,
+            reasoning_config=self.reasoning_config, service_tier=self.service_tier,
+            request_overrides=request_overrides, providers_allowed=self._providers_only,
+            providers_ignored=self._providers_ignore, providers_order=self._providers_order,
+            provider_sort=self._provider_sort,
+            provider_require_parameters=self._provider_require_params,
+            provider_data_collection=self._provider_data_collection,
+            openrouter_min_coding_score=self._openrouter_min_coding_score,
+            session_id=self.session_id, platform="cli", session_db=self._session_db,
+            clarify_callback=clarify_callback, connection_callback=connection_callback,
+            reasoning_callback=self._current_reasoning_callback(),
+            fallback_model=self._fallback_model, thinking_callback=self._on_thinking,
+            checkpoints_enabled=self.checkpoints_enabled,
+            checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+            checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
+            checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
+            pass_session_id=self.pass_session_id, skip_context_files=self.ignore_rules,
+            skip_memory=self.ignore_rules, tool_progress_callback=self._on_tool_progress,
+            tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
+            tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,
+            stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+            tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
+            notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
+            reaction_callback=self._on_reaction)
 
     def _resume_history_limit_error(self, tip_only: bool = False):
         """Return a safe-resume error without materializing transcript rows.

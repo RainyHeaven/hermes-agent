@@ -502,6 +502,7 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    user_turn: bool = False  # the user's own prompt (prompt.submit / its queue), never a synthesized turn
 
 
 def _adopt_out_of_band_turns(session: dict) -> None:
@@ -806,7 +807,9 @@ def _invoke_agent(
     try:
         from agent.notification_presentation import notification_turn, event_presentation_muted
         with notification_turn(agent, muted=event_presentation_muted("message.delta", sid), session_id=sid):
-            st.result = agent.run_conversation(run_message, **st.run_kwargs)
+            from tui_gateway import session_rollover
+            # The turn, or a held rollover resume; a due rollover is driven here, on this turn thread.
+            st.result = session_rollover.run_turn(sid, session, st, run_message, user_turn=st.user_turn)
     finally:
         # Stop AND join before anything emits: a tick surviving past message.complete would
         # roll the client's usage back to a stale snapshot (unbounded join: same worst case).
@@ -1126,6 +1129,8 @@ def _run_prompt_submit(
     # the synthesized turns that enter here directly (crash auto-continue, queued-prompt drain,
     # wake-ups) bypass prompt.submit's persist, and a row-less turn is otherwise materialized by
     # the token-accounting guard as an anonymous session (#111999).
+    # Claimed once per dispatch: only the user's own prompt may resume a held context rollover.
+    user_turn = bool(session.pop("_rollover_user_turn", False))
     if _ensure_session_db_row(session) is False:
         logger.warning(
             "prompt dispatch: session store unavailable for %s — this turn may not persist",
@@ -1167,6 +1172,7 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
+        st.user_turn = user_turn
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None,
             notification_category=(display_metadata or {}).get("notification_category"))
         goal_followup = None
@@ -1191,7 +1197,10 @@ def _run_prompt_submit(
                 from tui_gateway.free_tier_task_done import note_task_done
                 note_task_done(session, st.result, st.agent, display_kind)
             _emit("message.complete", sid, payload)
-            goal_followup = _goal_followup_after_turn(sid, session, st.result, status, raw)
+            from tui_gateway.session_rollover import suppresses_followups
+            # A rollover stop or held resume continues only on the user's own next message.
+            goal_followup = None if suppresses_followups(session, st.result) else _goal_followup_after_turn(
+                sid, session, st.result, status, raw)
             if status == "complete":
                 _after_complete_turn(sid, session, st, raw)
             # Goal judge + loop tick evaluation mutate persisted state AFTER message.complete: publish the

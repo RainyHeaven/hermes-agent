@@ -165,8 +165,10 @@ class CLITuiRuntimeMixin:
         # deferred as "worth its own review" and never re-landed (#20271).
         self._drain_interrupt_queue_to_pending_input()
 
-        # /goal continuation (queued user input still preempts), then /loop tick completion.
-        for hook, what in (
+        # /goal continuation (queued user input still preempts), then /loop tick completion. Never after a
+        # context-rollover stop or while its resume is held back: only the user's next message continues.
+        from hermes_cli.cli_context_rollover import suppresses_followups
+        for hook, what in () if suppresses_followups(self) else (
             (self._maybe_continue_goal_after_turn, "goal continuation"),
             (self._maybe_complete_loop_tick_after_turn, "loop completion"),
         ):

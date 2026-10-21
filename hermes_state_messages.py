@@ -986,7 +986,7 @@ class SessionMessagesMixin:
         lock_holder: Optional[str] = None, tail_count: int = 0,
         carried_messages: Optional[list[dict[str, Any]]] = None,
         covered_ids: Optional[list[int]] = None,
-        unresolved_held: Optional[list[dict[str, Any]]] = None) -> int:
+        unresolved_held: Optional[list[dict[str, Any]]] = None, count_full_compaction: bool = False) -> int:
         """Non-destructive in-place compaction under ONE session id: soft-archive the active rows (``active=0,
         compacted=1``: summarized away, still searchable) and insert *compacted_messages* as fresh active
         rows, atomically; returns the new ACTIVE count (= ``message_count``). *watermark* (compression
@@ -1002,7 +1002,9 @@ class SessionMessagesMixin:
         They are resolved inside this transaction by row id when present, else by unique durable identity +
         timestamp. Those originals and the clones' originals are superseded duplicates and get rewind flags
         (``active=0, compacted=0``) so search doesn't return each carried message once per compaction.
-        ``model_config_patch`` merges in the same txn (``None`` removes a key).
+        ``model_config_patch`` merges in the same txn (``None`` removes a key). *count_full_compaction*: this is
+        a committed full compaction (not a prune or micro pass), so the ledger read by
+        ``compression.rollover_after`` advances in the same txn.
 
         Concurrent-append safety (#75316): when *watermark* is provided (the value of
         :meth:`get_active_message_watermark` captured at compression START), rows that arrived during the
@@ -1019,10 +1021,12 @@ class SessionMessagesMixin:
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
-            patch = model_config_patch is not None
+            patch = model_config_patch is not None or count_full_compaction
+            config_patch = {**(model_config_patch or {}),
+                            **(self._full_compaction_count_patch(conn, session_id) if count_full_compaction else {})}
             # on_missing="raise": never commit against a vanished session row (caller keeps the original).
             patched_model_config = self._merge_model_config_json(
-                conn, session_id, model_config_patch, on_missing="raise") if patch else None
+                conn, session_id, config_patch, on_missing="raise") if patch else None
             proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
             if proved is not None:
                 return self._archive_named_rows(

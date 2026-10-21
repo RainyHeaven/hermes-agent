@@ -43,6 +43,7 @@ from agent.turn_scripted_prelude import Prelude, play_prelude
 from agent.turn_api_call import handle_api_interrupt, nous_rate_limit_guard, perform_api_call
 from agent.turn_api_error import handle_api_error
 from agent.turn_api_request import build_api_request
+from agent.context_rollover_gate import close_rollover_turn, rollover_yield, rollover_yield_before
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, failed_turn_notice, site_copy
 from agent.turn_final_response import finish_text_response
 from agent.turn_finalizer import finalize_turn
@@ -1500,6 +1501,9 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
     while s.retry_count < s.max_retries:
+        # A preflight or reactive overflow compaction can make a context rollover due: yield before the attempt.
+        if (_rollover := rollover_yield(agent, s)) is not None:
+            return _rollover
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
             return _ng.result
@@ -1637,10 +1641,14 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    # The context build may have compacted: a due context rollover ends the turn before any prelude or model call.
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
-    if agent.api_mode == "codex_app_server" and (codex_result := _codex_app_server_turn(agent, s)) is not None:
-        return codex_result
+    _early = rollover_yield_before(
+        agent, s, lambda: _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
+    )
+    if _early is not None:
+        return _early
 
     _prelude_action, _prelude_result = play_prelude(agent, s, prelude)
     if _prelude_action == "return":
@@ -1762,7 +1770,8 @@ def run_conversation(
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
-    _close_durable_failed_turn(agent, result)
+    if not close_rollover_turn(agent, result):
+        _close_durable_failed_turn(agent, result)
     return result
 
 

@@ -80,6 +80,8 @@ class CLIChatTurnMixin:
         if agent is None:
             return None
         self._sync_fallback_chain_with_config(agent)  # chain added after this chat opened reaches this turn
+        from hermes_cli.cli_context_rollover import arm as _arm_rollover
+        _arm_rollover(self)  # every turn, from the live config: a rebuilt agent is never left unarmed
         message = self._chat_route_images(message, images)
 
         if isinstance(message, str) and not isinstance(message, TimelineNotification):
@@ -353,13 +355,19 @@ class CLIChatTurnMixin:
         try:
             from agent.notification_presentation import notification_turn
             muted = getattr(turn, "mute_notification_reply", False)
+            from hermes_cli import cli_context_rollover as _rollover
             with notification_turn(self.agent, muted=muted, session_id=self.session_id):
-                turn.result = self.agent.run_conversation(
-                    user_message=agent_message,
-                    conversation_history=self.conversation_history[:-1],
-                    stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
-                    persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
-                )
+                if (_held := _rollover.held(self)) is not None:
+                    # A held-back rollover resume: this message is its latest instruction, never an ordinary turn.
+                    turn.result = _rollover.run_held_resume(self, _held, message)
+                else:
+                    turn.result = self.agent.run_conversation(
+                        user_message=agent_message,
+                        conversation_history=self.conversation_history[:-1],
+                        stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
+                        persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
+                    )
+                    turn.result = _rollover.after_turn(self, turn.result)
             if getattr(self, "_pending_moa_disable_after_turn", False):
                 _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                 for _key, _value in _restore.items():

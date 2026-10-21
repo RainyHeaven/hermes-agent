@@ -658,6 +658,9 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     agent._run_budget_started_at = (
         time.time() if getattr(agent, "run_budget_seconds", None) else None
     )
+    # A context-rollover resume turn continues its source turn's remaining budget (one-shot).
+    from agent.context_rollover_runtime import apply_budget_carry
+    apply_budget_carry(agent)
     # Reset the streaming context / think scrubbers at the top of each turn.
     for name in ("_stream_context_scrubber", "_stream_think_scrubber"):
         scrubber = getattr(agent, name, None)

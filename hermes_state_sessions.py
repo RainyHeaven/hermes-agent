@@ -728,12 +728,17 @@ class SessionSessionsMixin:
     def update_session_meta(
         self, session_id: str, model_config_json: str, model: Optional[str] = None,
     ) -> None:
-        """Update model_config and (COALESCE) optionally model."""
+        """Update model_config and (COALESCE) optionally model. The full-compaction ledger is not the
+        caller's: the stored value is re-read and kept in the same transaction."""
+        from hermes_state_compression import _keep_full_compaction_count_json
         self.flush_token_counts()  # barrier against queued token deltas — see update_session_model
-        self._write_sql(
-            "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-            (model_config_json, model, session_id),
-        )
+        def _do(conn):
+            row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            conn.execute(
+                "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
+                (_keep_full_compaction_count_json(row[0] if row else None, model_config_json), model, session_id),
+            )
+        self._execute_write(_do)
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -806,13 +811,15 @@ class SessionSessionsMixin:
     ):
         """SELECT + tolerant-parse + merge ``patch`` into model_config (the one place that keeps
         ``_branched_from``/``_delegate_from`` alive); ``None`` deletes a key. Returns serialized JSON
-        (``None`` when empty) or ``_MODEL_CONFIG_ROW_MISSING`` (``on_missing="raise"`` → ValueError)."""
+        (``None`` when empty) or ``_MODEL_CONFIG_ROW_MISSING`` (``on_missing="raise"`` → ValueError).
+        An unreadable stored config keeps the full-compaction ledger failing closed instead of reading zero."""
+        from hermes_state_compression import _keep_full_compaction_count
         row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
         if row is None:
             if on_missing == "raise":
                 raise ValueError(f"Session not found: {session_id}")
             return _MODEL_CONFIG_ROW_MISSING
-        config = _parse_model_config(row[0])
+        config = _keep_full_compaction_count(row[0], _parse_model_config(row[0]))
         for key, value in patch.items():
             if value is None:
                 config.pop(key, None)
@@ -839,12 +846,13 @@ class SessionSessionsMixin:
         copy, and a rotation cannot publish between finding the tip and writing it (the child would keep
         the old copy). ``update`` may run more than once (lock retry) and must be pure; returning None
         removes the key. Returns the id written, None when the row does not exist."""
+        from hermes_state_compression import _keep_full_compaction_count
         def _do(conn) -> Optional[str]:
             tip = self._compression_tip_on(conn, session_id)
             row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (tip,)).fetchone()
             if row is None:
                 return None
-            config = _parse_model_config(row[0])
+            config = _keep_full_compaction_count(row[0], _parse_model_config(row[0]))
             if (value := update(config.get(key))) is None:
                 config.pop(key, None)
             else:

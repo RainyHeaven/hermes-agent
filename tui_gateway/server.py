@@ -2653,7 +2653,7 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    cwd_override: str | None = None, auth_user_id: str | None = None):
+    cwd_override: str | None = None, auth_user_id: str | None = None, exact_route: dict | None = None):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2684,11 +2684,14 @@ def _make_agent(
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"), quiet_mode=True,
         verbose_logging=False,  # DEBUG agent logging; independent of tool_progress_mode
-        reasoning_config=(
+        # ``exact_route`` (context rollover): the source agent's own choices verbatim, None included, never config.
+        reasoning_config=(exact_route.get("reasoning_config") if exact_route is not None else
             reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
-        service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
-        enabled_toolsets=_onboarding_toolsets(_load_enabled_toolsets(platform), session_db, session_id or key),
-        disabled_toolsets=_load_disabled_toolsets(),
+        service_tier=(exact_route.get("service_tier") if exact_route is not None else
+                      service_tier_override if service_tier_override is not None else _load_service_tier()),
+        enabled_toolsets=(exact_route.get("enabled_toolsets") if exact_route is not None else
+                          _onboarding_toolsets(_load_enabled_toolsets(platform), session_db, session_id or key)),
+        disabled_toolsets=exact_route.get("disabled_toolsets") if exact_route is not None else _load_disabled_toolsets(),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
         providers_allowed=_pr.get("only"), providers_ignored=_pr.get("ignore"), providers_order=_pr.get("order"),
         provider_sort=_pr.get("sort"), provider_require_parameters=_pr.get("require_parameters", False),

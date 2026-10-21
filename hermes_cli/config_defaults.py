@@ -591,7 +591,6 @@ DEFAULT_CONFIG = {
         # lower of the ratio threshold and this count. Clamped to the model's context length.
         # Off by default: no single count suits windows from 64K to 1M+, so the ratio decides.
         "threshold_tokens": None,
-        # "progress_notices": False,    # opt-in (#52995): when True, routine compression
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
         # digests, anchor index, verbatim user messages and session_search pointers in the summary
@@ -605,8 +604,7 @@ DEFAULT_CONFIG = {
         # 1 = single last-user anchor; raise (e.g. 3) when bulky tool outputs fill the tail budget.
         "min_tail_user_messages": 1,
         # max_attempts: retry rounds before a turn gives up with "max compression attempts reached".
-        # Raise (e.g. 6) for tool-schema-heavy sessions. Validated >= 1, cap 10.
-        "max_attempts": 3,
+        "max_attempts": 3,  # Raise (e.g. 6) for tool-schema-heavy sessions. Validated >= 1, cap 10.
         # proactive_prune_tokens: opt-in trigger (tokens) for the deterministic no-LLM tool-result
         # prune, independent of `threshold` (which rarely fires on large windows, so old tool output
         # is re-sent every turn); e.g. 48000 reclaims early. 0 = off. Tail protected by
@@ -629,6 +627,8 @@ DEFAULT_CONFIG = {
         "micro_compact_every_n_turns": 1,
         # Once the rolling summary exceeds this many tokens, the next pass re-summarizes it.
         "micro_compact_defrag_threshold_tokens": 2000,
+        # rollover_after: after N committed full compactions, CLI/TUI resumes in a fresh session/agent
+        "rollover_after": 0,  # via verified handoff. 0 = off; non-integer/negative stays off, warned
         # Gateway session-hygiene force-compress threshold, by message count.
         "hygiene_hard_message_limit": 5000,
         # Max seconds the gateway waits for pre-agent hygiene compression WITHOUT forward progress.

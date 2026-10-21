@@ -3291,7 +3291,7 @@ def _compression_child_source(agent: Any, parent_session_id: str) -> str:
 
 def _publish_rotated_compaction(
     agent: Any, messages: list, compressed: list, *, new_system_prompt: str, lease: _CompressionLease,
-    old_session_id: str, compressed_user_turn_outcome: str,
+    old_session_id: str, compressed_user_turn_outcome: str, made_progress: bool = False,
 ) -> None:
     """Rotate the session: flush the parent, publish the child, re-point the agent.
     Flushes current-turn msgs to the OLD session, passing the durable prefix (messages[:persist idx]) so
@@ -3334,7 +3334,7 @@ def _publish_rotated_compaction(
         compression_lock_holder=lease.holder, require_compression_lease=lease.holder is not None,
         require_lease_refresh=lease.holder is not None, lease_ttl_seconds=lease.ttl,
         watermark=(lease.watermark if _foreign_tail_ceiling is not None else None),
-        watermark_ceiling=_foreign_tail_ceiling,
+        watermark_ceiling=_foreign_tail_ceiling, count_full_compaction=made_progress,
     )
     # `already_present` stamping is done by run_agent's _sync_persisted_markers;
     # this branch covers inserted/merged only; direct callers must use that wrapper.
@@ -3753,7 +3753,7 @@ def _commit_compaction(
                     agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
-                    covered_ids=covered_ids, unresolved_held=unresolved_held,
+                    covered_ids=covered_ids, unresolved_held=unresolved_held, count_full_compaction=made_progress,
                 )
                 compressed = persisted
                 split_status = "in_place_committed"
@@ -3791,7 +3791,7 @@ def _commit_compaction(
                     # gateway no longer rewrites a published child, so a head-only handoff loses the tail.
                     compressed = rejoin_compressed_head_and_tail(compressed, verbatim_tail)
                 _publish_rotated_compaction(
-                    agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease,
+                    agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease, made_progress=made_progress,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,
                 )
                 if verbatim_tail:
