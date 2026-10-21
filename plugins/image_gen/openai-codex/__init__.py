@@ -1,647 +1,317 @@
-"""OpenAI image generation backend — ChatGPT/Codex OAuth variant.
+"""OpenAI image generation — ChatGPT/Codex OAuth variant.
 
-Identical model catalog and tier semantics to the ``openai`` image-gen plugin
-(``gpt-image-2`` at low/medium/high quality), but routes the request through
-the Codex Responses API ``image_generation`` tool instead of the
-``images.generate`` REST endpoint. This lets users who are already
-authenticated with Codex/ChatGPT generate images without configuring a
-separate ``OPENAI_API_KEY``.
+Same catalog/tiers as the ``openai`` plugin (``gpt-image-2`` low/medium/high), posted to the
+Codex backend's native ``images/generations`` and ``images/edits`` endpoints, the same route the
+official Codex client uses (``codex-rs/ext/image-generation``). No ``OPENAI_API_KEY`` is needed.
 
-Selection precedence for the tier (first hit wins):
+There is deliberately NO chat/host model here. An earlier version rode a Responses call with a
+hosted ``image_generation`` tool on a pinned chat model (``gpt-5.5``): when OpenAI withdrew that id
+from an account cohort every image call 404'd while chat kept working (#105398, #107076), and the
+host model was free to answer in text instead of calling the tool. The native route has neither
+failure mode.
 
-1. ``OPENAI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
-2. ``image_gen.openai-codex.model`` in ``config.yaml``
-3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
-4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
-
-The host chat model that calls the ``image_generation`` tool is resolved at
-runtime from the raw authenticated Codex ``/models`` catalog (see
-:func:`_resolve_host_models`). ``image_gen.openai-codex.host_model`` in
-``config.yaml`` pins a specific host, but only when that slug is present in
-the account's raw catalog.
-
-Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
+The backend does not enforce ``model``/``quality``/``size`` — it accepts unknown model ids and
+returns its own quality/size (#107233). We send the catalog values and report what came back
+(``reported_quality``/``reported_size``) so a request that was not honoured is diagnosable.
 """
 
 from __future__ import annotations
 
-import hashlib
+import base64
 import json
 import logging
-import math
-import re
-import time
+import os
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.image_gen_provider import (
-    DEFAULT_ASPECT_RATIO,
-    ImageGenProvider,
-    error_response,
-    resolve_aspect_ratio,
-    save_b64_image,
-    success_response,
-)
+from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, save_b64_image, success_response
+from plugins.image_gen._common import (
+    GPT_IMAGE_2_API_MODEL as API_MODEL, GPT_IMAGE_2_DEFAULT as DEFAULT_MODEL, GPT_IMAGE_2_TIERS,
+    StaticImageGenProvider, collect_source_images, error_factory, prompt_required_error,
+    resolve_static_model, size_for)
 
 logger = logging.getLogger(__name__)
 
+_MAX_ERROR_BODY_CHARS = 500
 
-# ---------------------------------------------------------------------------
-# Model catalog — mirrors the ``openai`` plugin so the picker UX is identical.
-# ---------------------------------------------------------------------------
+_MAX_REFERENCE_IMAGES = 16
+_MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
+# The edit endpoint accepts raster only; the shared sniffer also knows SVG/TIFF/ICO, which it rejects.
+_ACCEPTED_INPUT_MIME = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
-API_MODEL = "gpt-image-2"
-
-_MODELS: Dict[str, Dict[str, Any]] = {
-    "gpt-image-2-low": {
-        "display": "GPT Image 2 (Low)",
-        "speed": "~15s",
-        "strengths": "Fast iteration, lowest cost",
-        "quality": "low",
-    },
-    "gpt-image-2-medium": {
-        "display": "GPT Image 2 (Medium)",
-        "speed": "~40s",
-        "strengths": "Balanced — default",
-        "quality": "medium",
-    },
-    "gpt-image-2-high": {
-        "display": "GPT Image 2 (High)",
-        "speed": "~2min",
-        "strengths": "Highest fidelity, strongest prompt adherence",
-        "quality": "high",
-    },
-}
-
-DEFAULT_MODEL = "gpt-image-2-medium"
-
-_SIZES = {
-    "landscape": "1536x1024",
-    "square": "1024x1024",
-    "portrait": "1024x1536",
-}
-
-# Codex Responses surface used for the request. The chat model is only the
-# host that calls the ``image_generation`` tool; the actual image work is done
-# by ``API_MODEL``. The host is discovered per account because the Codex
-# backend rejects slugs outside the account's lineup with HTTP 400.
-_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-_CODEX_MODELS_URL = f"{_CODEX_BASE_URL}/models?client_version=1.0.0"
-_CODEX_INSTRUCTIONS = (
-    "You are an assistant that must fulfill image generation requests by "
-    "using the image_generation tool when provided."
-)
-
-# Mainline host slugs look like ``gpt-6``, ``gpt-5.5`` or ``gpt-6-sol``.
-# Specialised variants (codex / mini / nano / pro / spark / multi-suffix) are
-# skipped — they are not general-purpose tool hosts.
-_MAINLINE_HOST_RE = re.compile(r"^gpt-\d+(?:\.\d+)*(?:-([a-z0-9]+))?$")
-_NON_MAINLINE_SUFFIXES = frozenset({"codex", "mini", "nano", "pro", "spark", "oss"})
-_MAX_HOST_ATTEMPTS = 3
-
-# In-process cache of the raw /models catalog, keyed by a token digest so the
-# OAuth token itself is never held as a key. Failures are never cached.
-_HOST_MODEL_CACHE_TTL = 600.0
-_HOST_MODEL_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+_NO_AUTH = (
+    "No Codex/ChatGPT OAuth credentials available. Run "
+    "`hermes auth add openai-codex` (or `hermes setup` → Codex) to sign in.")
 
 
-class CodexHostModelError(RuntimeError):
-    """No usable Codex host model could be determined for image generation."""
-
-
-class CodexHostModelRejected(RuntimeError):
-    """The Codex backend refused the chosen host model for this account."""
-
-    def __init__(self, host_model: str, detail: str) -> None:
-        super().__init__(f"Codex rejected host model '{host_model}': {detail}")
-        self.host_model = host_model
-
-
-# ---------------------------------------------------------------------------
-# Config + auth helpers
-# ---------------------------------------------------------------------------
-
-
-def _load_image_gen_config() -> Dict[str, Any]:
-    """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
+def _summarize_error_body(body: str) -> str:
+    """Bounded summary preferring parsed ``error.message`` (Codex bodies carry leading metadata)."""
+    text = body or ""
     try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
-        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
-        return section if isinstance(section, dict) else {}
-    except Exception as exc:
-        logger.debug("Could not load image_gen config: %s", exc)
-        return {}
-
-
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
-    """Decide which tier to use and return ``(model_id, meta)``."""
-    import os
-
-    env_override = os.environ.get("OPENAI_IMAGE_MODEL")
-    if env_override and env_override in _MODELS:
-        return env_override, _MODELS[env_override]
-
-    cfg = _load_image_gen_config()
-    sub = cfg.get("openai-codex") if isinstance(cfg.get("openai-codex"), dict) else {}
-    candidate: Optional[str] = None
-    if isinstance(sub, dict):
-        value = sub.get("model")
-        if isinstance(value, str) and value in _MODELS:
-            candidate = value
-    if candidate is None:
-        top = cfg.get("model")
-        if isinstance(top, str) and top in _MODELS:
-            candidate = top
-
-    if candidate is not None:
-        return candidate, _MODELS[candidate]
-
-    return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
+        payload = json.loads(text)
+        error = payload.get("error") if isinstance(payload, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:_MAX_ERROR_BODY_CHARS]
+    except (TypeError, ValueError):
+        pass
+    return text[:_MAX_ERROR_BODY_CHARS]
 
 
-def _read_codex_access_token() -> Optional[str]:
-    """Return a usable Codex OAuth token, or None.
+def _resolve_model() -> tuple[str, dict[str, Any]]:
+    return resolve_static_model(
+        GPT_IMAGE_2_TIERS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai-codex")
 
-    Delegates to the canonical reader in ``agent.auxiliary_client`` so token
-    expiry, credential pool selection, and JWT decoding stay in one place.
-    """
+
+def _read_codex_credential() -> tuple[Optional[str], Optional[str]]:
+    """``(token, base_url)`` from one resolution (``agent.auxiliary_client`` owns expiry/pool/JWT):
+    the image request goes to the host the token's credential routes to (pool row /
+    ``model.base_url`` / profile override), never a default it does not belong to (#121486).
+    ``(None, None)`` without a usable token."""
     try:
-        from agent.auxiliary_client import _read_codex_access_token as _reader
+        from agent.auxiliary_client import _resolve_codex_credential_and_base
 
-        token = _reader()
+        token, base_url = _resolve_codex_credential_and_base()
         if isinstance(token, str) and token.strip():
-            return token.strip()
-        return None
+            return token.strip(), base_url
+        return None, None
     except Exception as exc:
-        logger.debug("Could not resolve Codex access token: %s", exc)
-        return None
+        logger.debug("Could not resolve Codex credential: %s", exc)
+        return None, None
 
 
-# ---------------------------------------------------------------------------
-# Host model discovery
-# ---------------------------------------------------------------------------
-
-
-_DEFAULT_PRIORITY_RANK = 10_000
-
-
-def _priority_rank(priority: Any) -> int:
-    """Map a /models ``priority`` to a sort rank; unusable values sort last."""
-    if isinstance(priority, bool):
-        return _DEFAULT_PRIORITY_RANK
-    if isinstance(priority, int):
-        return priority
-    if isinstance(priority, float) and math.isfinite(priority):
-        return int(priority)
-    return _DEFAULT_PRIORITY_RANK
-
-
-def _fetch_raw_codex_models(token: str) -> List[str]:
-    """Return visible slugs from the raw authenticated Codex ``/models`` catalog.
-
-    Deliberately bypasses ``hermes_cli.codex_models``: that helper appends
-    synthetic forward-compat slugs and hardcoded fallbacks the account may not
-    be able to use. Raises :class:`CodexHostModelError` on any failure.
-    """
-    import httpx
-    from agent.auxiliary_client import _codex_cloudflare_headers
-
-    headers = _codex_cloudflare_headers(token)
-    headers["Authorization"] = f"Bearer {token}"
+def _httpx_available() -> bool:
     try:
-        resp = httpx.get(_CODEX_MODELS_URL, headers=headers, timeout=15.0)
-    except Exception as exc:
-        # Only the exception type: the message (and chained traceback) can
-        # echo request headers, including the bearer token.
-        raise CodexHostModelError(
-            f"Codex /models request failed: {type(exc).__name__}"
-        ) from None
-    if resp.status_code != 200:
-        raise CodexHostModelError(f"Codex /models returned HTTP {resp.status_code}")
-    try:
-        data = resp.json()
-    except Exception as exc:
-        raise CodexHostModelError("Codex /models returned a non-JSON body") from exc
-    entries = data.get("models") if isinstance(data, dict) else None
-    if not isinstance(entries, list):
-        raise CodexHostModelError("Codex /models response has no 'models' list")
-
-    sortable: List[Tuple[int, str]] = []
-    for item in entries:
-        if not isinstance(item, dict):
-            continue
-        slug = item.get("slug")
-        if not isinstance(slug, str) or not slug.strip():
-            continue
-        visibility = item.get("visibility")
-        if isinstance(visibility, str) and visibility.strip().lower() in {"hide", "hidden"}:
-            continue
-        sortable.append((_priority_rank(item.get("priority")), slug.strip()))
-
-    sortable.sort(key=lambda entry: (entry[0], entry[1]))
-    slugs: List[str] = []
-    for _, slug in sortable:
-        if slug not in slugs:
-            slugs.append(slug)
-    return slugs
+        import httpx
+    except ImportError:
+        return False
+    return True
 
 
-def _cached_raw_codex_models(token: str) -> List[str]:
-    """:func:`_fetch_raw_codex_models` with a short per-token in-process cache."""
-    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    now = time.monotonic()
-    hit = _HOST_MODEL_CACHE.get(key)
-    if hit and now - hit[0] < _HOST_MODEL_CACHE_TTL:
-        return list(hit[1])
-    slugs = _fetch_raw_codex_models(token)
-    if slugs:
-        _HOST_MODEL_CACHE[key] = (now, list(slugs))
-    return slugs
+def _sniff_image_mime(raw: bytes) -> Optional[str]:
+    from agent.image_routing import _sniff_mime_from_bytes
+
+    mime = _sniff_mime_from_bytes(raw)
+    return mime if mime in _ACCEPTED_INPUT_MIME else None
 
 
-def _rank_host_models(slugs: List[str]) -> List[str]:
-    """Keep mainline host candidates, preserving the backend's priority order."""
-    ranked: List[str] = []
-    for slug in slugs:
-        match = _MAINLINE_HOST_RE.match(slug)
-        if match and match.group(1) not in _NON_MAINLINE_SUFFIXES and slug not in ranked:
-            ranked.append(slug)
-    return ranked
+def _encode_input_image(raw: bytes, too_big: str, unsupported: str) -> str:
+    """Size- and MIME-check raw image bytes, then return a canonical ``data:`` URL."""
+    if len(raw) > _MAX_INPUT_IMAGE_BYTES:
+        raise ValueError(too_big)
+    mime = _sniff_image_mime(raw)
+    if mime is None:
+        raise ValueError(unsupported)
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
-def _configured_host_model() -> Optional[str]:
-    sub = _load_image_gen_config().get("openai-codex")
-    value = sub.get("host_model") if isinstance(sub, dict) else None
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
+def _data_url_to_input_image_url(value: str) -> str:
+    if "," not in value:
+        raise ValueError("Image data URL is missing a comma separator")
+    header, data = value.split(",", 1)
+    header_lc = header.lower()
+    if not header_lc.startswith("data:image/") or ";base64" not in header_lc:
+        raise ValueError("Only base64 data:image URLs are supported as Codex image inputs")
+    return _encode_input_image(
+        base64.b64decode(data, validate=True),
+        "Image data URL exceeds 25MB cap",
+        "Image data URL does not contain supported image bytes")
 
 
-def _resolve_host_models(token: str) -> List[str]:
-    """Return host model candidates (best first) for this Codex account.
+def _remote_image_to_data_url(value: str) -> str:
+    """The edit endpoint takes inline data URLs only (as the official client sends), so fetch."""
+    from tools.url_safety import create_ssrf_safe_client, is_safe_url
 
-    A configured ``image_gen.openai-codex.host_model`` is honoured only when
-    the raw catalog lists it. Raises :class:`CodexHostModelError` instead of
-    guessing a hardcoded slug when discovery fails or finds nothing usable.
-    """
-    slugs = _cached_raw_codex_models(token)
-    if not slugs:
-        raise CodexHostModelError("Codex /models returned no models for this account")
-
-    override = _configured_host_model()
-    if override:
-        if override in slugs:
-            return [override]
-        raise CodexHostModelError(
-            f"Configured image_gen.openai-codex.host_model '{override}' is not in "
-            f"this account's Codex model list: {', '.join(slugs)}"
-        )
-
-    ranked = _rank_host_models(slugs)
-    if not ranked:
-        raise CodexHostModelError(
-            "No mainline Codex host model found in this account's model list "
-            f"({', '.join(slugs)}); set image_gen.openai-codex.host_model to one of them"
-        )
-    return ranked
+    if not is_safe_url(value):
+        raise ValueError(f"Image URL failed the SSRF safety check: {value}")
+    with create_ssrf_safe_client(timeout=60.0, follow_redirects=True) as client:
+        response = client.get(value)
+    response.raise_for_status()
+    return _encode_input_image(
+        response.content,
+        f"Image URL exceeds 25MB cap: {value}",
+        f"Image URL did not return a supported image: {value}")
 
 
-def _build_responses_payload(
-    *, prompt: str, size: str, quality: str, host_model: str
-) -> Dict[str, Any]:
-    """Build the Codex Responses request body for an image_generation call."""
-    return {
-        "model": host_model,
-        "store": False,
-        "instructions": _CODEX_INSTRUCTIONS,
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
-        }],
-        "tools": [{
-            "type": "image_generation",
-            "model": API_MODEL,
-            "size": size,
-            "quality": quality,
-            "output_format": "png",
-            "background": "opaque",
-            "partial_images": 1,
-        }],
-        "tool_choice": {
-            "type": "allowed_tools",
-            "mode": "required",
-            "tools": [{"type": "image_generation"}],
-        },
-        "stream": True,
+def _local_image_to_data_url(value: str) -> str:
+    from agent.file_safety import get_read_block_error
+
+    blocked = get_read_block_error(value)
+    if blocked:
+        raise ValueError(blocked)
+    path = Path(os.path.expanduser(value)).resolve()
+    if not path.is_file():
+        raise ValueError(f"Image input path does not exist or is not a file: {value}")
+    if path.stat().st_size <= 0:
+        raise ValueError(f"Image input path is empty: {value}")
+    return _encode_input_image(
+        path.read_bytes(),
+        f"Image input path exceeds 25MB cap: {value}",
+        f"Image input path is not a supported image: {value}")
+
+
+def _to_input_image(value: str) -> dict[str, str]:
+    """Convert a URL/data URL/local path into an ``images[]`` entry for ``images/edits``."""
+    candidate = (value or "").strip()
+    if not candidate:
+        raise ValueError("Blank image input")
+    lowered = candidate.lower()
+    if lowered.startswith(("http://", "https://")):
+        image_url = _remote_image_to_data_url(candidate)
+    elif lowered.startswith("data:"):
+        image_url = _data_url_to_input_image_url(candidate)
+    else:
+        image_url = _local_image_to_data_url(candidate)
+    return {"image_url": image_url}
+
+
+def _normalize_input_images(
+    image_url: Optional[str], reference_image_urls: Optional[list[str]]
+) -> list[dict[str, str]]:
+    values = collect_source_images(image_url, reference_image_urls, limit=_MAX_REFERENCE_IMAGES)
+    return [_to_input_image(value) for value in values]
+
+
+def _build_image_request(
+    *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None
+) -> tuple[str, dict[str, Any]]:
+    """``(endpoint_path, json_body)`` — ``images/edits`` when sources are present, else
+    ``images/generations``. Field set mirrors the official client's ``ImageGenerationRequest`` /
+    ``ImageEditRequest``."""
+    body: dict[str, Any] = {
+        "prompt": prompt, "model": API_MODEL, "n": 1, "quality": quality, "size": size,
+        "background": "opaque",
     }
+    if input_images:
+        body["images"] = input_images
+        return "images/edits", body
+    return "images/generations", body
 
 
-def _extract_image_b64(value: Any) -> Optional[str]:
-    """Return the newest image b64 embedded in a Responses event payload."""
-    found: Optional[str] = None
-    if isinstance(value, dict):
-        if value.get("type") == "image_generation_call":
-            result = value.get("result")
-            if isinstance(result, str) and result:
-                found = result
-        partial = value.get("partial_image_b64")
-        if isinstance(partial, str) and partial:
-            found = partial
-        for child in value.values():
-            nested = _extract_image_b64(child)
-            if nested:
-                found = nested
-    elif isinstance(value, list):
-        for child in value:
-            nested = _extract_image_b64(child)
-            if nested:
-                found = nested
-    return found
+def _post_image_request(
+    token: str, *, prompt: str, size: str, quality: str, input_images: Optional[list[dict[str, str]]] = None,
+    base_url: str,
+) -> dict[str, Any]:
+    """POST to the native Codex images endpoint; return the decoded JSON body plus
+    ``imagegen_request_id`` (backend correlation id, for support tickets).
 
-
-def _iter_sse_json(response: Any):
-    """Yield JSON payloads from an SSE response without OpenAI SDK parsing.
-
-    The ChatGPT/Codex backend can emit image-generation events newer than the
-    pinned Python SDK understands. Parsing raw SSE keeps this provider tolerant
-    of those event-shape changes.
-    """
-    event_name: Optional[str] = None
-    data_lines: List[str] = []
-
-    def flush():
-        nonlocal event_name, data_lines
-        if not data_lines:
-            event_name = None
-            return None
-        raw = "\n".join(data_lines).strip()
-        event = event_name
-        event_name = None
-        data_lines = []
-        if not raw or raw == "[DONE]":
-            return None
-        payload = json.loads(raw)
-        if isinstance(payload, dict) and event and "type" not in payload:
-            payload["type"] = event
-        return payload
-
-    for line in response.iter_lines():
-        if isinstance(line, bytes):
-            line = line.decode("utf-8", errors="replace")
-        line = str(line)
-        if line == "":
-            payload = flush()
-            if payload is not None:
-                yield payload
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("event:"):
-            event_name = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            data_lines.append(line[len("data:"):].lstrip())
-
-    payload = flush()
-    if payload is not None:
-        yield payload
-
-
-def _collect_image_b64(
-    token: str, *, prompt: str, size: str, quality: str, host_model: str
-) -> Optional[str]:
-    """Stream a Codex Responses image_generation call and return the b64 image."""
+    ``base_url`` must come from the same resolution as ``token`` (``_read_codex_credential``)."""
     import httpx
-    from agent.auxiliary_client import _codex_cloudflare_headers
+    from agent.codex_headers import codex_cloudflare_headers
 
-    headers = _codex_cloudflare_headers(token)
+    base_url = base_url.strip().rstrip("/")
+    headers = codex_cloudflare_headers(token, base_url=base_url)
     headers.update({
-        "Accept": "text/event-stream",
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
+        "x-codex-image-turn-id": str(uuid.uuid4()),
     })
-    payload = _build_responses_payload(
-        prompt=prompt, size=size, quality=quality, host_model=host_model
-    )
-    timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
-
-    image_b64: Optional[str] = None
+    path, body = _build_image_request(prompt=prompt, size=size, quality=quality, input_images=input_images)
+    timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=60.0, pool=30.0)
     with httpx.Client(timeout=timeout, headers=headers) as http:
-        with http.stream("POST", f"{_CODEX_BASE_URL}/responses", json=payload) as response:
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                exc.response.read()
-                body = exc.response.text[:500]
-                if exc.response.status_code == 400 and "not supported" in body.lower():
-                    raise CodexHostModelRejected(host_model, body[:200]) from exc
-                raise RuntimeError(
-                    f"Codex Responses API returned HTTP {exc.response.status_code}: {body}"
-                ) from exc
-            for event in _iter_sse_json(response):
-                found = _extract_image_b64(event)
-                if found:
-                    image_b64 = found
-
-    return image_b64
+        response = http.post(f"{base_url}/{path}", json=body)
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Codex images API returned HTTP {response.status_code}: "
+            f"{_summarize_error_body(response.text)}")
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("Codex images API returned a non-object body")
+    payload["imagegen_request_id"] = response.headers.get("x-codex-imagegen-request-id")
+    return payload
 
 
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
+def _png_pixel_size(raw: bytes) -> Optional[str]:
+    """``"{w}x{h}"`` for a PNG payload, or None if not a PNG IHDR."""
+    import struct
+
+    if len(raw) < 24 or raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", raw[16:24])
+    return f"{width}x{height}"
 
 
-class OpenAICodexImageGenProvider(ImageGenProvider):
+class OpenAICodexImageGenProvider(StaticImageGenProvider):
     """gpt-image-2 routed through ChatGPT/Codex OAuth instead of an API key."""
 
-    @property
-    def name(self) -> str:
-        return "openai-codex"
-
-    @property
-    def display_name(self) -> str:
-        return "OpenAI (Codex auth)"
+    provider_id = "openai-codex"
+    label = "OpenAI (Codex auth)"
+    models = GPT_IMAGE_2_TIERS
+    default_model_id = DEFAULT_MODEL
+    price = "varies"
 
     def is_available(self) -> bool:
-        if not _read_codex_access_token():
-            return False
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            return False
-        return True
+        return bool(_read_codex_credential()[0]) and _httpx_available()
 
-    def list_models(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "id": model_id,
-                "display": meta["display"],
-                "speed": meta["speed"],
-                "strengths": meta["strengths"],
-                "price": "varies",
-            }
-            for model_id, meta in _MODELS.items()
-        ]
-
-    def default_model(self) -> Optional[str]:
-        return DEFAULT_MODEL
-
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "OpenAI (Codex auth)",
             "badge": "free",
-            "tag": "gpt-image-2 via ChatGPT/Codex OAuth — no API key required",
+            "tag": "gpt-image-2 via ChatGPT/Codex OAuth — no API key required; supports text and image inputs",
             "env_vars": [],
+            # Empty env_vars means the picker writes the selection without a credential prompt; the shared
+            # Codex OAuth bootstrap hook (hermes_cli/tools_config_post_setup.py) starts the sign-in (#102144).
+            "post_setup": "openai_codex",
             "post_setup_hint": (
-                "Sign in with `hermes auth codex` (or `hermes setup` → Codex) "
-                "if you haven't already. No API key needed."
-            ),
+                "Sign in with `hermes auth add openai-codex` (or `hermes setup` → Codex) "
+                "if you haven't already. No API key needed."),
         }
 
+    def capabilities(self) -> dict[str, Any]:
+        return {"modalities": ["text", "image"], "max_reference_images": _MAX_REFERENCE_IMAGES}
+
     def generate(
-        self,
-        prompt: str,
-        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        self, prompt: str, aspect_ratio: str = DEFAULT_ASPECT_RATIO, *,
+        image_url: Optional[str] = None, reference_image_urls: Optional[list[str]] = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-
         if not prompt:
-            return error_response(
-                error="Prompt is required and must be a non-empty string",
-                error_type="invalid_argument",
-                provider="openai-codex",
-                aspect_ratio=aspect,
-            )
-
-        if not _read_codex_access_token():
-            return error_response(
-                error=(
-                    "No Codex/ChatGPT OAuth credentials available. Run "
-                    "`hermes auth codex` (or `hermes setup` → Codex) to sign in."
-                ),
-                error_type="auth_required",
-                provider="openai-codex",
-                aspect_ratio=aspect,
-            )
-
-        try:
-            import httpx  # noqa: F401
-        except ImportError:
-            return error_response(
-                error="httpx Python package not installed (pip install httpx)",
-                error_type="missing_dependency",
-                provider="openai-codex",
-                aspect_ratio=aspect,
-            )
+            return prompt_required_error("openai-codex", aspect)
+        token, base_url = _read_codex_credential()
+        if not token:
+            return error_factory("openai-codex", aspect)(_NO_AUTH, "auth_required")
+        if not _httpx_available():
+            return error_factory("openai-codex", aspect)(
+                "httpx Python package not installed (pip install httpx)", "missing_dependency")
 
         tier_id, meta = _resolve_model()
-        size = _SIZES.get(aspect, _SIZES["square"])
-
-        token = _read_codex_access_token()
-        if not token:
-            return error_response(
-                error=(
-                    "No Codex/ChatGPT OAuth credentials available. Run "
-                    "`hermes auth codex` (or `hermes setup` → Codex) to sign in."
-                ),
-                error_type="auth_required",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+        size = size_for(aspect)
+        fail = error_factory("openai-codex", aspect, model=tier_id, prompt=prompt)
+        try:
+            input_images = _normalize_input_images(image_url, reference_image_urls)
+        except Exception as exc:
+            return fail(f"Invalid image input for Codex image editing: {exc}", "invalid_image_input")
 
         try:
-            host_models = _resolve_host_models(token)
-        except CodexHostModelError as exc:
-            return error_response(
-                error=f"Could not select a Codex host model for image generation: {exc}",
-                error_type="host_model_unavailable",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
-        b64: Optional[str] = None
-        host_model = host_models[0]
-        rejected: List[str] = []
-        try:
-            for host_model in host_models[:_MAX_HOST_ATTEMPTS]:
-                try:
-                    b64 = _collect_image_b64(
-                        token,
-                        prompt=prompt,
-                        size=size,
-                        quality=meta["quality"],
-                        host_model=host_model,
-                    )
-                    break
-                except CodexHostModelRejected:
-                    logger.info("Codex rejected image host model %s; trying next", host_model)
-                    rejected.append(host_model)
-            else:
-                return error_response(
-                    error=(
-                        "Codex rejected every candidate host model for image "
-                        f"generation ({', '.join(rejected)}); set "
-                        "image_gen.openai-codex.host_model to a supported model"
-                    ),
-                    error_type="host_model_unavailable",
-                    provider="openai-codex",
-                    model=tier_id,
-                    prompt=prompt,
-                    aspect_ratio=aspect,
-                )
+            payload = _post_image_request(
+                token, prompt=prompt, size=size, quality=meta["quality"], input_images=input_images or None,
+                base_url=base_url)
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
-            return error_response(
-                error=f"OpenAI image generation via Codex auth failed: {exc}",
-                error_type="api_error",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+            return fail(f"OpenAI image generation via Codex auth failed: {exc}", "api_error")
 
-        if not b64:
-            return error_response(
-                error="Codex response contained no image_generation_call result",
-                error_type="empty_response",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
+        data = payload.get("data")
+        b64 = data[0].get("b64_json") if isinstance(data, list) and data and isinstance(data[0], dict) else None
+        if not isinstance(b64, str) or not b64:
+            return fail("Codex images API response contained no image data", "empty_response")
 
         try:
+            pixel_size = _png_pixel_size(base64.b64decode(b64))
             saved_path = save_b64_image(b64, prefix=f"openai_codex_{tier_id}")
         except Exception as exc:
-            return error_response(
-                error=f"Could not save image to cache: {exc}",
-                error_type="io_error",
-                provider="openai-codex",
-                model=tier_id,
-                prompt=prompt,
-                aspect_ratio=aspect,
-            )
-
+            return fail(f"Could not save image to cache: {exc}", "io_error")
         return success_response(
-            image=str(saved_path),
-            model=tier_id,
-            prompt=prompt,
-            aspect_ratio=aspect,
-            provider="openai-codex",
-            extra={"size": size, "quality": meta["quality"], "host_model": host_model},
-        )
-
-
-# ---------------------------------------------------------------------------
-# Plugin entry point
-# ---------------------------------------------------------------------------
+            image=str(saved_path), model=tier_id, prompt=prompt, aspect_ratio=aspect,
+            provider="openai-codex", modality="image" if input_images else "text",
+            extra={
+                "size": size, "quality": meta["quality"], "input_image_count": len(input_images),
+                "requested_size": size, "pixel_size": pixel_size,
+                "reported_quality": payload.get("quality"), "reported_size": payload.get("size"),
+                "imagegen_request_id": payload.get("imagegen_request_id"),
+            })
 
 
 def register(ctx) -> None:
