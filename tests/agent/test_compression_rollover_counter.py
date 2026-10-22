@@ -18,7 +18,7 @@ from agent.context_rollover import FULL_COMPACTION_COUNT_KEY, RolloverStateError
 from hermes_state import SessionDB
 
 
-def _make_agent(db, sid, *, in_place=True, progress=True):
+def _make_agent(db, sid, *, in_place=True, progress=True, summary_fallback=False):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
 
@@ -32,6 +32,7 @@ def _make_agent(db, sid, *, in_place=True, progress=True):
 
     def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
         compressor._last_compression_made_progress = progress
+        compressor._last_summary_fallback_used = summary_fallback
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
             {"role": "assistant", "content": "recent reply 1"},
@@ -95,6 +96,24 @@ def test_no_progress_compaction_does_not_count(tmp_path: Path):
         _seed(db, sid)
         _compact(_make_agent(db, sid, progress=False), db)
         assert read_full_compaction_count(db, sid) == 0
+
+
+@pytest.mark.parametrize("in_place", [True, False])
+def test_summary_fallback_compaction_commits_but_does_not_count(tmp_path: Path, in_place):
+    """A compaction whose summary call failed drops turns behind a placeholder: it still commits, but a
+    rollover must not treat that lost context as a successful full compaction."""
+    with closing(SessionDB(db_path=tmp_path / "state.db")) as db:
+        sid = f"ROLLOVER_FALLBACK_{in_place}"
+        _seed(db, sid)
+        agent = _make_agent(db, sid, in_place=in_place, summary_fallback=True)
+        _compact(agent, db)
+        live = agent.session_id
+        assert _active_rows(db, live) == 4  # the compaction itself still committed
+        assert read_full_compaction_count(db, live) == 0
+        # A later compaction with a real summary counts normally on the same conversation.
+        good = _make_agent(db, live, in_place=in_place)
+        _compact(good, db)
+        assert read_full_compaction_count(db, good.session_id) == 1
 
 
 def test_lease_contention_skip_does_not_count(tmp_path: Path):

@@ -25,6 +25,7 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 
 ### C3. 컨텍스트 rollover (누적 압축 후 새 세션·새 에이전트로 이어가기)
 - 의도: CLI/TUI 세션에서 full compaction이 `compression.rollover_after`회 쌓이면 안전한 턴 경계에서 인계 자료를 저장하고 새 세션으로 같은 작업을 이어간다. 기본 0=꺼짐.
+- 집계 기준: 실제 요약이 만들어진 full compaction만 센다. 요약 생성 실패로 대체 문구만 남은 압축(`_last_summary_fallback_used`)은 세지 않는다(`agent/conversation_compression.py::_commit_compaction`의 `_counts_as_full`).
 - 새 모듈(충돌 위험 낮음): `agent/context_rollover*.py`, `hermes_cli/cli_context_rollover.py`, `hermes_state_rollover.py`, `tui_gateway/session_rollover.py`
 - 코어 연결 지점(충돌 위험 높음): `agent/conversation_compression.py`, `agent/conversation_loop.py`, `agent/turn_context.py`, `hermes_cli/cli_agent_setup_mixin.py`, `hermes_cli/cli_chat_turn_mixin.py`, `hermes_cli/cli_tui_runtime_mixin.py`, `hermes_cli/config_defaults.py`, `hermes_state_compression.py`, `hermes_state_messages.py`, `hermes_state_sessions.py`, `tui_gateway/{methods_prompt,prompt_turn,server,session_auto_continue}.py`
 - 확인 테스트: `tests/agent/test_context_rollover*.py`, `tests/agent/test_compression_rollover_counter.py`, `tests/hermes_cli/test_cli_context_rollover.py`, `tests/hermes_state/test_session_rollover.py`, `tests/tui_gateway/test_session_rollover.py`

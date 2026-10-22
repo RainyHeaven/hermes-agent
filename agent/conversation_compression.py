@@ -3674,6 +3674,7 @@ def _commit_compaction(
     new_system_prompt: str, system_message: str, compressed_user_turn_outcome: str,
     messages_before_compression: Optional[list], made_progress: bool, attempt: _Attempt,
     verbatim_tail: Optional[list] = None, carried_messages: Optional[list] = None,
+    summary_fallback_used: bool = False,
 ) -> _CommitOutcome:
     """Persist the compacted transcript: anti-growth guard, memory extraction, then the
     in-place archive or the parent->child rotation.
@@ -3682,6 +3683,9 @@ def _commit_compaction(
     ``refused_prompt`` so the caller hands back the input unchanged. ``verbatim_tail`` (``/compress here N``) is
     re-inserted after the compacted head by either commit and stamped once durable.
     """
+    # Context rollover counts only a full compaction with a real summary: a summary-fallback commit dropped
+    # turns behind a placeholder, so treating it as success would hand a rollover the lost context.
+    _counts_as_full = made_progress and not summary_fallback_used
     session_commit_succeeded = False
     compacted_in_place = False
     commit_started_at = time.monotonic()
@@ -3753,7 +3757,7 @@ def _commit_compaction(
                     agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
                     lock_holder=lease.holder, tail_count=tail_count, carried_messages=carried_messages,
-                    covered_ids=covered_ids, unresolved_held=unresolved_held, count_full_compaction=made_progress,
+                    covered_ids=covered_ids, unresolved_held=unresolved_held, count_full_compaction=_counts_as_full,
                 )
                 compressed = persisted
                 split_status = "in_place_committed"
@@ -3791,7 +3795,7 @@ def _commit_compaction(
                     # gateway no longer rewrites a published child, so a head-only handoff loses the tail.
                     compressed = rejoin_compressed_head_and_tail(compressed, verbatim_tail)
                 _publish_rotated_compaction(
-                    agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease, made_progress=made_progress,
+                    agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease, made_progress=_counts_as_full,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,
                 )
                 if verbatim_tail:
@@ -4295,6 +4299,7 @@ def compress_context(
             agent, messages, compressed, in_place=in_place, lease=lease, new_system_prompt=new_system_prompt,
             system_message=system_message, compressed_user_turn_outcome=compressed_user_turn_outcome,
             messages_before_compression=messages_before_compression, made_progress=_compression_made_progress,
+            summary_fallback_used=_compression_used_fallback,
             attempt=attempt, verbatim_tail=verbatim_tail,
             # The reinserted copy keeps the original's _row_id/timestamp (production flush stamps
             # both); carry exactly that one row so the commit rewinds the durable original instead
