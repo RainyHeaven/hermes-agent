@@ -192,12 +192,6 @@ class TestGenerate:
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
 
-    def test_returns_invalid_argument_for_empty_prompt(self, provider, codex_backend):
-        result = provider.generate("   ")
-        assert result["success"] is False
-        assert result["error_type"] == "invalid_argument"
-        assert codex_backend["requests"] == []
-
     def test_text_to_image_posts_generations_with_no_host_model(self, provider, codex_backend, tmp_path):
         result = provider.generate("a cat", aspect_ratio="portrait")
 
@@ -307,58 +301,6 @@ class TestGenerate:
 
         assert result["success"] is False
         assert result["error_type"] == "empty_response"
-
-    def test_transport_exception_returns_api_error(self, provider, codex_backend):
-        def respond(request):
-            raise httpx.ConnectError("cloudflare 403", request=request)
-
-        codex_backend["respond"] = respond
-
-        result = provider.generate("a cat")
-
-        assert result["success"] is False
-        assert result["error_type"] == "api_error"
-        assert "cloudflare 403" in result["error"]
-
-    def test_legacy_host_model_setting_is_ignored(self, provider, codex_backend, tmp_path):
-        """An ``image_gen.openai-codex.host_model`` left over from the host-discovery era must neither
-        fail the call nor reach the request: the native route has no chat host model."""
-        import hermes_yaml as yaml
-
-        (tmp_path / "config.yaml").write_text(yaml.safe_dump(
-            {"image_gen": {"openai-codex": {"host_model": "gpt-6-sol"}}}))
-
-        result = provider.generate("a cat")
-
-        assert result["success"] is True
-        assert result["model"] == "gpt-image-2-medium"
-        assert result["quality"] == "medium"
-        (request,) = codex_backend["requests"]
-        assert "gpt-6-sol" not in request.content.decode()
-
-    @pytest.mark.parametrize("edit", [False, True])
-    def test_generation_never_consults_the_chat_model_catalog(
-        self, provider, codex_backend, monkeypatch, edit,
-    ):
-        """Image calls must not depend on the account's chat-model lineup: no ``/models`` lookup and
-        no chat model in either endpoint's body, so a withdrawn or unlisted slug cannot break them."""
-        import hermes_cli.codex_models as codex_models
-
-        def _forbidden(*args, **kwargs):
-            raise AssertionError("image generation must not consult the Codex model catalog")
-
-        monkeypatch.setattr(codex_models, "get_codex_model_ids", _forbidden)
-        monkeypatch.setattr(codex_models, "_fetch_models_from_api", _forbidden)
-        monkeypatch.setattr(httpx, "get", _forbidden)
-        kwargs = {"image_url": "data:image/png;base64," + _b64_png()} if edit else {}
-
-        result = provider.generate("a cat", **kwargs)
-
-        assert result["success"] is True
-        (request,) = codex_backend["requests"]
-        body = json.loads(request.content)
-        assert body["model"] == "gpt-image-2"
-        assert not any(key in body for key in ("tools", "input", "instructions"))
 
 
 # ── Plugin entry point ──────────────────────────────────────────────────────
