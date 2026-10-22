@@ -19,8 +19,9 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 - 의도: 채널마다 `channel_text_batch_delays` / `channel_text_batch_split_delays`로 메시지 묶음 지연을 다르게 둔다. 정확한 채널 → 부모 채널 순으로 찾는다.
 - 파일: `plugins/platforms/discord/adapter.py` (upstream 훅 `_text_batch_delay_for`에 연결), `tests/gateway/test_text_batching.py`
 - 설정: `discord.channel_text_batch_delays`, `discord.channel_text_batch_split_delays` (upstream config_loader가 extra로 전달하므로 gateway/config.py 수정 불필요)
-- 확인 테스트: `tests/gateway/test_text_batching.py`
-- 제거 조건: upstream에 같은 기능이 들어가면 제거. upstream PR 후보.
+- 종료 시 처리: `cancel_background_tasks`가 아직 지연 대기 중인 배치를 즉시 dispatch한다. 채널 지연(예: 15초)이 종료 flush 기한(5초 미만)보다 길면 기한 초과 cancel로 메시지가 사라지기 때문이다.
+- 확인 테스트: `tests/gateway/test_text_batching.py`, `tests/gateway/test_discord_channel_delay_shutdown.py`
+- 제거 조건: upstream에 같은 기능이 들어가면 제거. upstream은 배치 지연 상한(2~4초) 방침이라 PR보다 기능 제안 이슈를 먼저 연다. 제출 전 테스트의 wall-clock sleep을 upstream health 규칙(HX013)에 맞게 바꿔야 한다.
 
 ### C3. 컨텍스트 rollover (누적 압축 후 새 세션·새 에이전트로 이어가기)
 - 의도: CLI/TUI 세션에서 full compaction이 `compression.rollover_after`회 쌓이면 안전한 턴 경계에서 인계 자료를 저장하고 새 세션으로 같은 작업을 이어간다. 기본 0=꺼짐.
@@ -32,7 +33,7 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 ### C4. plugin_validate 테스트의 macOS 진단 suffix 허용 (테스트 전용)
 - 의도: macOS에서는 가용성 detail 뒤에 `,<진단>`이 붙어 upstream 테스트가 실패한다. 상태 토큰만 비교하도록 3줄 보정한다. 제품 코드 변경 없음.
 - 파일: `tests/hermes_cli/test_plugin_validate.py`
-- 제거 조건: upstream에서 같은 보정이 들어가면 제거. upstream PR 후보.
+- 제거 조건: upstream에서 같은 보정이 들어가면 제거. upstream PR #142824 제출(2026-10-22).
 
 ## 알려진 환경 의존 실패 (커스텀과 무관)
 
@@ -43,8 +44,8 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 | 항목 | 제거 이유 | 보관 위치 |
 |---|---|---|
 | GitHub 스킬의 `~/Git/.env` 토큰 대체 경로 | 1순위 인증인 `gh auth`가 로그인돼 있어 대체 경로가 쓰이지 않음. 번들 스킬 수정은 매 버전업 충돌 원인 | 로컬 보관 패치 |
-| v16 세션 마이그레이션 추정 제거 | 이 기기 DB가 이미 v31이라 다시 실행되지 않음 | upstream PR 후보 |
-| Codex 이미지 회귀 테스트 3종 | upstream v0.22.2가 같은 native 경로를 구현함. 테스트만 남은 차이 | upstream PR 후보 |
+| v16 세션 마이그레이션 추정 제거 | 이 기기 DB가 이미 v31이라 다시 실행되지 않음 | upstream PR #142823 제출 |
+| Codex 이미지 회귀 테스트 3종 | upstream v0.22.2가 같은 native 경로를 구현함. 테스트만 남은 차이(포크 전용 host_model 관련이라 upstream 제출 안 함) | 로컬 보관 패치 |
 
 보관 패치: `~/.hermes/reports/fork-slimming-20261022/upstream-candidates/` (저장소 밖, 비공개)
 

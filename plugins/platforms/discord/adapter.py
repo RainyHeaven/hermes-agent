@@ -2179,14 +2179,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         ``_pending_text_batch_tasks`` mid-send dropped replies); the flush deadline stays below the
         gateway's per-adapter disconnect budget so the outer ``wait_for`` can't hard-cancel us."""
         pending = list(self._pending_text_batch_tasks.values())
-        if pending:
+        # A batch still in its quiet period is dispatched now: a per-channel delay
+        # (channel_text_batch_delays) can outlast the deadline below, whose cancel would drop it.
+        # Its sleeping flush task then pops nothing, so nothing is dispatched twice.
+        waiting = [self._flush_text_batch_now(key) for key in list(self._pending_text_batches)]
+        if pending or waiting:
             logger.info(
                 "[%s] Flushing %d pending text-batch task(s) before shutdown",
                 self.name, len(pending),
             )
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True),
+                    asyncio.gather(*waiting, *pending, return_exceptions=True),
                     timeout=self._text_batch_flush_deadline_seconds(),
                 )
             except TimeoutError:
