@@ -52,7 +52,11 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 
 상세 절차는 Hermes 스킬 `hermes-agent`의 `references/fork-upgrade-runbook.md`를 따른다.
 
-1. 대상은 upstream 안정판 태그로 고정한다(main 아님). 다른 작업과 섞지 않는다.
+1. 대상은 upstream 안정판 태그로 고정한다(main 아님). 다른 작업과 섞지 않는다. 새 태그는 바로 받지 않고 어느 정도 안정화된 뒤 받는다(사용자 결정 2026-10-22). 기준: 출시 후 2주 이상 지났고, 그 사이 같은 영역의 긴급 수정이 이어지지 않으며, 구조 변경이 있으면 커스텀 영향 범위를 먼저 확인한다.
+
+## 보류 중인 버전업 메모
+
+- v0.22.4 (2026-10-21): 보류. 클래식 CLI가 공유 gateway 클라이언트(`hermes_cli/gateway_agent.py`)로 바뀌어 턴이 gateway 프로세스에서 실행된다. 이에 따라 C3의 CLI 어댑터(`hermes_cli/cli_context_rollover.py`, `_agent_build_kwargs`)는 그대로 쓸 수 없고, TUI gateway 경로 하나로 CLI까지 처리하도록 재설계가 필요하다. `_make_agent`는 `tui_gateway/agent_factory.py`로 이동했다(exact_route 이식 패치 보관). 같은 버전의 `post_compaction` plugin hook으로 압축 횟수 집계를 옮기고, 집계·인계 기록을 rollover 전용 테이블로 옮기면 `hermes_state_{compression,messages,sessions}.py` 수정을 없앨 수 있다. 다음 안정판에서 함께 진행한다.
 2. 개발 clone `~/Git/hermes-agent-dev`에서 태그 위로 병합하고, 이 문서의 항목별 확인 테스트를 돌린다. `git rerere`가 켜져 있어 이전 충돌 해소가 재사용된다.
 3. 설치본 `~/.hermes/hermes-agent`는 개발 clone에서 fetch 후 ff-only로만 반영한다.
 4. 반영 후 번들 스킬 동기화 결과(`hermes skills list-modified`)와 config 보존 키를 확인한다. 업데이트된 번들 스킬을 예전 버전으로 되돌리지 않는다.
