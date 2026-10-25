@@ -36,6 +36,13 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 - 파일: `tests/hermes_cli/test_plugin_validate.py`
 - 제거 조건: upstream에서 같은 보정이 들어가면 제거. upstream PR #142824 제출(2026-10-22).
 
+### C5. 대시보드 PTY 재부착 키의 세션 계보 일치 (`/api/pty` keep-alive)
+- 의도: 터미널을 resume=A로 연 뒤 그 안에서 압축·rollover로 후속 세션 B가 생기면, 같은 attach 토큰으로 다시 붙을 때 키가 `…\0B`로 바뀌어 살아 있는(진행 중 턴일 수 있는) 같은 터미널이 4409로 닫히고 새 PTY가 떴다. 같은 attach·profile 접두의 살아 있는 키 중 resume 세그먼트의 최신 후속이 지금 요청의 최신 후속과 같은 것이 정확히 하나면 그 터미널로 다시 붙는다. 없거나 여럿이거나 조회 실패(warning 로그)면 기존 동작. lease를 대시보드 in-memory gateway가 잡는 배치에서는 holder_pid로 터미널을 식별할 수 없어서 계보를 쓴다.
+- 파일: `hermes_cli/web_routers/chat_ws.py`(`_latest_descendant_for`, `_lineage_attach_key`, keep-alive 경로 한 줄), `hermes_cli/pty_session.py`(`PtySessionRegistry.live_keys_with_prefix`)
+- 확인 테스트: `tests/hermes_cli/test_pty_resume_lineage_ws.py`(하네스 7개, 실제 세션 DB 2개)
+- 알려진 한계: 터미널 안에서 `/resume`으로 다른 대화로 옮긴 뒤에도 같은 토큰의 계보 요청은 그 터미널에 붙는다(같은 키 재부착에도 원래 있던 한계). fresh로 연 키(resume 세그먼트 없음)는 대상이 아니다.
+- 제거 조건: upstream에 같은 수정이 들어가면 제거. upstream PR 후보(재현 시험 포함).
+
 ## 알려진 환경 의존 실패 (커스텀과 무관)
 
 - `tests/hermes_state/` 의 state_db repair/maintenance 계열 63건은 v0.22.2 + 커스텀 기준선에서도 동일하게 실패한다(2026-10-22, 이 기기·test-venv). 버전업 검증에서는 실패 ID 집합을 기준선 clone과 비교해 새 실패만 본다.

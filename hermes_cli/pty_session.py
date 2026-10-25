@@ -266,6 +266,13 @@ class PtySessionRegistry:
             self._sessions[key] = session
             return session, True
 
+    def live_keys_with_prefix(self, prefix: str) -> list[str]:
+        """Keys of live sessions registered under ``prefix`` plus a segment separator.
+
+        Read-only and unlocked: attach_or_spawn re-checks liveness under the lock.
+        """
+        return [key for key, s in self._sessions.items() if s.alive and key.startswith(prefix + "\0")]
+
     async def close_other_sessions(self, prefix: str, *, keep_key: str) -> None:
         """Close sessions belonging to the same logical client except ``keep_key``.
 

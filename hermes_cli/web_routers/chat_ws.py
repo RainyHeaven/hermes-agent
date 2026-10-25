@@ -17,7 +17,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisco
 
 from agent.interrupt_scope import InterruptScope, bind_interrupt_scope
 from hermes_cli.active_sessions import ActiveSessionRegistryError, active_session_registry_snapshot
-from hermes_cli.pty_session import RegistryFull
+from hermes_cli.pty_session import RegistryFull, _key_segments
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
 from hermes_cli.web_server_chat import (
@@ -479,6 +479,52 @@ def _lease_holder_pid(session_id: Optional[str], *, registry_home: Optional[str]
     return None
 
 
+def _latest_descendant_for(resume: str, profile: Optional[str]) -> Optional[str]:
+    """Newest descendant of ``resume`` in ``profile``'s session store. Blocking: call off-loop."""
+    from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
+    # Same profile rule as _resolve_chat_argv: blank or "current" is the dashboard's own store.
+    requested = (profile or "").strip()
+    scoped = requested if requested and requested.lower() != "current" else None
+    db = _open_session_db_for_profile(scoped, read_only=True)
+    try:
+        leaf, _path = _session_latest_descendant(resume, db)
+    finally:
+        db.close()
+    return leaf
+
+
+async def _lineage_attach_key(
+    registry: Any, raw_attach_token: str, profile: Optional[str], registry_resume: Optional[str], attach_token: str,
+) -> str:
+    """The live keep-alive key to reattach to when the requested chat has rolled over.
+
+    A terminal opened on resume A keeps A in its key while compaction or rollover
+    inside it creates descendant B, so the next attach for A resolves to B and would
+    supersede that live terminal with a fresh PTY. When the dashboard's in-memory
+    gateway holds the lease, lease-pid ancestry cannot identify the terminal, so
+    lineage does. No match, an ambiguous match or a failed lookup keeps the
+    requested key (a fresh spawn, as before).
+    """
+    if not registry_resume:
+        return attach_token
+    live = registry.live_keys_with_prefix(f"{raw_attach_token}\0{profile or ''}")
+    if attach_token in live:
+        return attach_token
+    matches = []
+    for key in live:
+        resume = _key_segments(key)[1]
+        if not resume:
+            continue
+        try:
+            leaf = await asyncio.to_thread(_latest_descendant_for, resume, profile)
+        except Exception:  # health: allow BLE001 -- an unreadable session store only means no lineage match; fall back to a fresh PTY
+            _log.warning("pty lineage lookup failed resume=%s; keeping requested key", resume, exc_info=True)
+            continue
+        if leaf == registry_resume:
+            matches.append(key)
+    return matches[0] if len(matches) == 1 else attach_token
+
+
 async def _pump_keepalive_input(ws: WebSocket, session: Any) -> None:
     """Writer loop for a keep-alive /api/pty socket: forward client input to the
     session's bridge, consuming resize escapes locally. On child EOF the drain
@@ -640,6 +686,7 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
+    attach_token = await _lineage_attach_key(PTY_REGISTRY, raw_attach_token, profile, registry_resume, attach_token)
     try:
         await PTY_REGISTRY.close_other_sessions(raw_attach_token, keep_key=attach_token)
         holder_pid = _lease_holder_pid(registry_resume, registry_home=(env or {}).get("HERMES_HOME"))
