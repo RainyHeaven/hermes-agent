@@ -58,6 +58,20 @@ export function modelPickerCommand(
   return `${model} --provider ${providerSlug}${effort} ${scope}`
 }
 
+/** `model.options` params: keys are only present when set (the backend
+ *  defaults to the configured-provider subset without `include_unconfigured`). */
+export function modelOptionsRequestParams(
+  sessionId: string | null | undefined,
+  refresh: boolean,
+  includeUnconfigured: boolean
+): { include_unconfigured?: true; refresh?: true; session_id?: string } {
+  return {
+    ...(sessionId ? { session_id: sessionId } : {}),
+    ...(refresh ? { refresh: true as const } : {}),
+    ...(includeUnconfigured ? { include_unconfigured: true as const } : {})
+  }
+}
+
 export function providerIndexAfterClearingFilter(
   providerRows: ProviderRow[],
   provider: ModelOptionProvider | undefined
@@ -115,15 +129,25 @@ export function ModelPicker({
     (allowPersistGlobal ? M.persist.toggleHint : M.persist.onlySuffix)
 
   useEffect(() => {
-    gw.request<ModelOptionsResult>('model.options', {
-      ...(sessionId ? { session_id: sessionId } : {}),
-      ...(initialRefresh ? { refresh: true } : {}),
-      // The TUI picker shows the full provider universe with setup
-      // affordances ("paste KEY to activate"), so opt into unconfigured
-      // rows — the backend now defaults to the configured subset for
-      // desktop chat pickers (#56974).
-      include_unconfigured: true
-    })
+    // List only configured providers, like the classic CLI picker. When none
+    // are configured (fresh install), fall back once to the full list so the
+    // "paste KEY to activate" rows stay available for first-time setup.
+    const load = (includeUnconfigured: boolean) =>
+      gw.request<ModelOptionsResult>(
+        'model.options',
+        modelOptionsRequestParams(sessionId, initialRefresh, includeUnconfigured)
+      )
+
+    load(false)
+      .then(raw => {
+        const r = asRpcResult<ModelOptionsResult>(raw)
+
+        if (r && !(r.providers ?? []).length) {
+          return load(true)
+        }
+
+        return raw
+      })
       .then(raw => {
         const r = asRpcResult<ModelOptionsResult>(raw)
 

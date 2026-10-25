@@ -1,7 +1,7 @@
 import type { ModelOptionProvider } from '@hermes/shared/gateway-events'
 import { describe, expect, it } from 'vitest'
 
-import { providerIndexAfterClearingFilter } from '../components/modelPicker.js'
+import { modelOptionsRequestParams, providerIndexAfterClearingFilter } from '../components/modelPicker.js'
 
 const provider = (slug: string, name = slug): ModelOptionProvider => ({ name, slug })
 
@@ -44,5 +44,27 @@ describe('ModelPicker provider filtering', () => {
     ]
 
     expect(providerIndexAfterClearingFilter(rows, p)).toBe(0)
+  })
+})
+
+describe('modelOptionsRequestParams', () => {
+  it('omits include_unconfigured by default so only configured providers are listed', () => {
+    const params = modelOptionsRequestParams('s1', false, false)
+
+    expect(params).toEqual({ session_id: 's1' })
+    expect('include_unconfigured' in params).toBe(false)
+  })
+
+  it('adds refresh: true when refreshing', () => {
+    expect(modelOptionsRequestParams('s1', true, false)).toEqual({ refresh: true, session_id: 's1' })
+  })
+
+  it('adds include_unconfigured: true for the fallback request', () => {
+    expect(modelOptionsRequestParams('s1', false, true)).toEqual({ include_unconfigured: true, session_id: 's1' })
+  })
+
+  it('omits session_id when there is no session', () => {
+    expect('session_id' in modelOptionsRequestParams(null, false, false)).toBe(false)
+    expect('session_id' in modelOptionsRequestParams(undefined, false, false)).toBe(false)
   })
 })
