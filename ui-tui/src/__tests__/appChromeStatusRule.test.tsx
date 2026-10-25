@@ -480,3 +480,20 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     expect(textContent(element)).not.toContain('weekly-digest')
   })
 })
+
+describe('StatusRule — YOLO badge', () => {
+  it.each([80, 160])('shows the pinned ⚡ YOLO badge in the error colour at cols %i', cols => {
+    const element = StatusRule({ ...baseProps, cols, yolo: true })
+
+    expect(textContent(element)).toContain('⚡ YOLO')
+
+    const badge = findElementWithText(element, '⚡ YOLO')
+
+    expect(badge?.props.color).toBe(DEFAULT_THEME.color.error)
+  })
+
+  it('hides the badge when yolo is absent or false', () => {
+    expect(textContent(StatusRule({ ...baseProps }))).not.toContain('YOLO')
+    expect(textContent(StatusRule({ ...baseProps, yolo: false }))).not.toContain('YOLO')
+  })
+})

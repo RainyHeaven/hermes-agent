@@ -554,6 +554,7 @@ export function StatusRule({
   sessionStartedAt,
   turnStartedAt,
   voiceLabel,
+  yolo,
   onSessionCountClick,
   t
 }: StatusRuleProps) {
@@ -613,13 +614,18 @@ export function StatusRule({
       ? noticeReserve
       : stringWidth(status)
 
+  // YOLO badge. Pinned like the focus badge (not tail-budgeted): tools running
+  // without approval must always be visible, so it never drops off a narrow terminal.
+  const showYolo = !!yolo
+
   const essentialWidth =
     stringWidth('─ ') +
     batteryWidth +
     slotWidth +
     stringWidth(' │ ') +
     stringWidth(modelText) +
-    (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
+    (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0) +
+    (showYolo ? stringWidth(' │ ⚡ YOLO') : 0)
 
   const rightLabel = sessionTitle && ok('title') ? ` ${sessionTitle} ` : cwdLabel
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
@@ -775,6 +781,14 @@ export function StatusRule({
             </Text>
           ) : null}
         </Box>
+        {showYolo ? (
+          <Box flexDirection="row" flexShrink={0}>
+            <Text color={t.color.muted}>{' │ '}</Text>
+            <Text bold color={t.color.error}>
+              ⚡ YOLO
+            </Text>
+          </Box>
+        ) : null}
         {showFocus ? (
           <Box flexDirection="row" flexShrink={0}>
             <Text color={t.color.muted}>{' │ '}</Text>
@@ -1014,6 +1028,8 @@ interface StatusRuleProps {
   turnStartedAt?: null | number
   usage: Usage
   voiceLabel?: string
+  // YOLO mode (session.info.yolo) — tools run without approval; pinned like the focus badge.
+  yolo?: boolean
   onSessionCountClick?: () => void
 }
 
