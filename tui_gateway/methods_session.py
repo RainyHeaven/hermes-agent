@@ -1078,6 +1078,18 @@ def _resume_eager(ctx: _Resume) -> dict:
         auto_continue=_maybe_schedule_auto_continue(sid, session, ctx.target) if session else None)
 
 
+def _resume_fallback_cwd(stored, params_cwd, profile_home):
+    """cwd a resumed session runs in: its stored cwd ALWAYS wins; else the opener's folder (``params.cwd``, an
+    absolute existing host dir, local backend only); else the profile default."""
+    import os
+    if resolved := _resumable_stored_cwd(stored, profile_home):
+        return resolved
+    if (params_cwd and os.path.isabs(params_cwd) and os.path.isdir(params_cwd)
+            and not _cwd_is_remote(profile_home)):
+        return os.path.normpath(params_cwd)
+    return _profile_default_cwd(profile_home)
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     if not (target := params.get("session_id", "")):
@@ -1093,8 +1105,8 @@ def _(rid, params: dict) -> dict:
         _resume_follow_tip(ctx)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
-        ctx.profile_resume_cwd = (_resumable_stored_cwd(_str_param(ctx.found, "cwd"), ctx.profile_home)
-                                  or _profile_default_cwd(ctx.profile_home))
+        ctx.profile_resume_cwd = _resume_fallback_cwd(
+            _str_param(ctx.found, "cwd"), _str_param(params, "cwd"), ctx.profile_home)
         with _session_resume_lock:  # fast path: reuse a session live IN THIS PROFILE, never another's
             live = _find_live_session_by_key(ctx.target, ctx.profile_home)
         if live is not None:

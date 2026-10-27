@@ -381,7 +381,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         const previousSid = getUiState().sid
 
         return gw
-          .request<SessionResumeResult>('session.resume', { cols: colsRef.current, session_id: id })
+          .request<SessionResumeResult>('session.resume', {
+            cols: colsRef.current,
+            session_id: id,
+            ...(STARTUP_WORKSPACE_CWD ? { cwd: STARTUP_WORKSPACE_CWD } : {})
+          })
           .then(raw => {
             const r = asRpcResult<SessionResumeResult>(raw)
 

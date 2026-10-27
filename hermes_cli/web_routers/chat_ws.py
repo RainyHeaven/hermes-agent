@@ -581,6 +581,16 @@ async def _pty_channel_marker_state(
     return active_session_file, marker_preexisting, resume
 
 
+def _resume_startup_cwd(raw):
+    """``?cwd=`` on a RESUMED chat: the folder sessions started inside that tab (``/new``) land in.
+    Never blocks the resume: a dead/relative path is ignored (None), unlike a fresh chat's fail-closed pick."""
+    from hermes_cli.web_routers.chat_workspaces import resolve_chat_cwd
+    try:
+        return resolve_chat_cwd(raw) or None
+    except HTTPException:
+        return None
+
+
 @router.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     from hermes_cli.web_server_chat import PTY_REGISTRY, PtyBridge, PtyUnavailableError, _PTY_BRIDGE_AVAILABLE, _RESIZE_RE
@@ -621,8 +631,12 @@ async def pty_ws(ws: WebSocket) -> None:
     resolve_kwargs = {"resume": resume, "sidecar_url": sidecar_url, "profile": profile}
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
-    # A picked workspace only applies to a FRESH chat; a resumed session keeps its own cwd.
-    if not resume:
+    # A picked workspace only applies to a FRESH chat; a resumed session keeps its own cwd, but the
+    # tab's folder still seeds sessions started inside it (startup_cwd: HERMES_TUI_CWD only).
+    if resume:
+        if startup_cwd := _resume_startup_cwd(ws.query_params.get("cwd")):
+            resolve_kwargs["startup_cwd"] = startup_cwd
+    else:
         from hermes_cli.web_routers.chat_workspaces import resolve_chat_cwd
         try:
             workspace_cwd = resolve_chat_cwd(ws.query_params.get("cwd"))
