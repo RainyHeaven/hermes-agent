@@ -1194,8 +1194,30 @@ def _(rid, params: dict) -> dict:
     # ``_finalized`` sessions linger until the reaper pops them (they inflated the footer). Do NOT filter on
     # the WS-detached sentinel: detached is attachable until grace-reap, and ``hermes --tui`` rides stdio.
     # Keep insertion order (focused must not jump).
-    rows = [_session_live_item(sid, session, current) for sid, session in snapshot if not session.get("_finalized")]
-    return _ok(rid, {"sessions": rows})
+    # ``workspace_cwd`` scopes the list to one project like ``session.list`` (MAP hosts every project tab
+    # in one gateway); the current tab always stays. Absent → unchanged response shape.
+    import os
+
+    raw_cwd = params.get("workspace_cwd")
+    workspace_cwd = raw_cwd.strip() if isinstance(raw_cwd, str) else ""
+    workspace = _workspace_filter_key(workspace_cwd) if workspace_cwd else None
+    key = os.path.realpath(workspace) if workspace else ""
+
+    def in_scope(sid: str, session: dict) -> bool:
+        if not key or sid == current:
+            return True
+        cwd = session.get("cwd")
+        if not cwd:
+            return False
+        real = os.path.realpath(str(cwd))
+        return real == key or real.startswith(key + os.sep)
+
+    rows = [_session_live_item(sid, session, current) for sid, session in snapshot
+            if not session.get("_finalized") and in_scope(sid, session)]
+    result = {"sessions": rows}
+    if workspace_cwd:
+        result["workspace"] = workspace
+    return _ok(rid, result)
 
 
 @_session_method("session.activate")

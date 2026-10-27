@@ -61,6 +61,16 @@ type WorkspaceSessionListResult = SessionListResult & { workspace?: null | strin
 export const sessionListParams = (workspaceCwd: undefined | string, showAll: boolean) =>
   showAll || !workspaceCwd ? { limit: 200 } : { limit: 200, workspace_cwd: workspaceCwd }
 
+/** `session.active_list` params: same workspace scope as `session.list` (the current tab always stays). */
+export const activeListParams = (
+  currentSessionId: null | string | undefined,
+  workspaceCwd: undefined | string,
+  showAll: boolean
+) =>
+  showAll || !workspaceCwd
+    ? { current_session_id: currentSessionId }
+    : { current_session_id: currentSessionId, workspace_cwd: workspaceCwd }
+
 const workspaceName = (path: string) =>
   path
     .replace(/[\\/]+$/, '')
@@ -399,9 +409,10 @@ export function ActiveSessionSwitcher({
         // wipe the live-session list: live sessions still render and the
         // resumable history degrades on its own.
         const [liveRes, histRes] = await Promise.allSettled([
-          gw.request<SessionActiveListResponse>('session.active_list', {
-            current_session_id: currentSessionId
-          }),
+          gw.request<SessionActiveListResponse>(
+            'session.active_list',
+            activeListParams(currentSessionId, workspaceCwd, showAll)
+          ),
           includeHistory
             ? gw.request<SessionListResult>('session.list', sessionListParams(workspaceCwd, showAll))
             : Promise.resolve(null)

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  activeListParams,
   orchestratorGlobalHotkeyHint,
   orchestratorGlobalHotkeyHintSegments,
   scopeLabel,
@@ -14,6 +15,13 @@ describe('session switcher workspace scope', () => {
     expect(sessionListParams('/repo/app', true)).toEqual({ limit: 200 })
     expect(sessionListParams(undefined, false)).toEqual({ limit: 200 })
     expect(sessionListParams('', false)).toEqual({ limit: 200 })
+  })
+
+  it('scopes the open-session list the same way as the saved list', () => {
+    expect(activeListParams('s1', '/repo/app', false)).toEqual({ current_session_id: 's1', workspace_cwd: '/repo/app' })
+    expect(activeListParams('s1', '/repo/app', true)).toEqual({ current_session_id: 's1' })
+    expect(activeListParams('s1', undefined, false)).toEqual({ current_session_id: 's1' })
+    expect(activeListParams('s1', '', false)).toEqual({ current_session_id: 's1' })
   })
 
   it('labels a filtered list with the project folder name', () => {
