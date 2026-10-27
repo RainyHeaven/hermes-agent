@@ -53,6 +53,27 @@ export const activeSessionCountLabel = (count: number) =>
 export const sessionsCountLabel = (liveCount: number, resumableCount: number) =>
   messages().pickers.session.counts(liveCount, resumableCount)
 
+// `workspace` is a string when the server filtered to a project, null when the
+// folder is too broad (home, /, HERMES_HOME) or no workspace_cwd was sent.
+type WorkspaceSessionListResult = SessionListResult & { workspace?: null | string }
+
+/** `session.list` params: scope to the workspace unless showing all (or no cwd is known). */
+export const sessionListParams = (workspaceCwd: undefined | string, showAll: boolean) =>
+  showAll || !workspaceCwd ? { limit: 200 } : { limit: 200, workspace_cwd: workspaceCwd }
+
+const workspaceName = (path: string) =>
+  path
+    .replace(/[\\/]+$/, '')
+    .split(/[\\/]/)
+    .pop() || path
+
+/** Scope line above the list; resolved at call time so it follows the active language. */
+export const scopeLabel = (workspace?: null | string) => {
+  const scope = messages().pickers.session.scope
+
+  return workspace ? scope.project(workspaceName(workspace)) : scope.all
+}
+
 export type SessionRowKind = 'history' | 'live' | 'new'
 
 /**
@@ -149,6 +170,8 @@ export const orchestratorGlobalHotkeyHintSegments = (): OrchestratorHintSegment[
     { role: 'text', text: h.new },
     { role: 'hotkey', text: 'Ctrl+R' },
     { role: 'text', text: h.refresh },
+    { role: 'hotkey', text: 'Ctrl+A' },
+    { role: 'text', text: messages().pickers.session.scope.toggle },
     { role: 'hotkey', text: 'Esc' },
     { role: 'text', text: h.close }
   ]
@@ -312,7 +335,8 @@ export function ActiveSessionSwitcher({
   onNewPrompt,
   onResume,
   onSelect,
-  t
+  t,
+  workspaceCwd
 }: ActiveSessionSwitcherProps) {
   const [items, setItems] = useState<SessionActiveItem[]>([])
   const [history, setHistory] = useState<SessionListRow[]>([])
@@ -329,6 +353,9 @@ export function ActiveSessionSwitcher({
   // different session. Any other key cancels the prompt.
   const [confirmDelete, setConfirmDelete] = useState<null | string>(null)
   const [deleting, setDeleting] = useState(false)
+  // Default to this project's sessions; Ctrl+A flips to every project.
+  const [showAll, setShowAll] = useState(false)
+  const [workspace, setWorkspace] = useState<null | string>(null)
   const T = useT()
   const S = T.pickers.session
   const C = T.pickers.common
@@ -375,7 +402,9 @@ export function ActiveSessionSwitcher({
           gw.request<SessionActiveListResponse>('session.active_list', {
             current_session_id: currentSessionId
           }),
-          includeHistory ? gw.request<SessionListResult>('session.list', { limit: 200 }) : Promise.resolve(null)
+          includeHistory
+            ? gw.request<SessionListResult>('session.list', sessionListParams(workspaceCwd, showAll))
+            : Promise.resolve(null)
         ])
 
         const r = liveRes.status === 'fulfilled' ? asRpcResult<SessionActiveListResponse>(liveRes.value) : null
@@ -396,10 +425,11 @@ export function ActiveSessionSwitcher({
 
         if (includeHistory) {
           if (histRes.status === 'fulfilled') {
-            const parsedHist = asRpcResult<SessionListResult>(histRes.value)
+            const parsedHist = asRpcResult<WorkspaceSessionListResult>(histRes.value)
 
             if (parsedHist) {
               rawHistoryRef.current = parsedHist.sessions ?? []
+              setWorkspace(typeof parsedHist.workspace === 'string' ? parsedHist.workspace : null)
             } else {
               histError = messages().pickers.common.invalidResponse('session.list')
             }
@@ -455,7 +485,7 @@ export function ActiveSessionSwitcher({
         return []
       }
     },
-    [currentSessionId, gw]
+    [currentSessionId, gw, showAll, workspaceCwd]
   )
 
   useEffect(() => {
@@ -620,6 +650,13 @@ export function ActiveSessionSwitcher({
       return
     }
 
+    // Toggling changes `load`'s deps, so the effect re-queries history.
+    if (isCtrl('a')) {
+      setShowAll(v => !v)
+
+      return
+    }
+
     if (key.tab) {
       if (newSelected) {
         setPickingModel(true)
@@ -714,6 +751,9 @@ export function ActiveSessionSwitcher({
         {S.title}
       </Text>
       <Text color={t.color.muted}>{sessionsCountLabel(items.length, history.length)}</Text>
+      <Text color={t.color.muted} wrap="truncate-end">
+        {scopeLabel(workspace)}
+      </Text>
 
       {err && <Text color={t.color.label}>{C.error(err)}</Text>}
 
@@ -755,6 +795,7 @@ export function ActiveSessionSwitcher({
 
       {offset > 0 && <Text color={t.color.muted}>{C.moreAbove(offset)}</Text>}
       {!listLen && <Text color={t.color.muted}>{S.noOtherSessions}</Text>}
+      {!!workspace && !histCount && <Text color={t.color.muted}>{S.scope.emptyProject}</Text>}
 
       {visibleRows.map(i => {
         const selected = sel === i
@@ -937,4 +978,5 @@ interface ActiveSessionSwitcherProps {
   onResume: (id: string) => void
   onSelect: (id: string) => void
   t: Theme
+  workspaceCwd?: string
 }

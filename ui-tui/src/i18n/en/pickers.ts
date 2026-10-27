@@ -146,6 +146,14 @@ export const pickersEn = {
         move: ' move · ',
         new: ' new · ',
         refresh: ' refresh · '
+      },
+      // Resume list scope: this project (default) or all projects (Ctrl+A).
+      scope: {
+        // {0} = basename of the project root.
+        project: (name: string) => `this project: ${name}`,
+        all: 'all projects',
+        toggle: ' all/project · ',
+        emptyProject: 'no sessions in this project — Ctrl+A shows all'
       }
     },
     pet: {

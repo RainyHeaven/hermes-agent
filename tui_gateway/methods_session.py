@@ -538,6 +538,29 @@ def _session_list_by_title(rid, db, title_lookup: str) -> dict:
     return _ok(rid, {"sessions": [_session_row_summary(row, tip_row=tip_row, resolved_id=tip, db=db)]})
 
 
+def _workspace_filter_key(cwd: str) -> str | None:
+    """``session.list`` ``workspace_cwd`` → ``cwd_prefix`` key (git main repo root, else the realpath), or
+    None (no filter) for relative paths, probe failures, and catch-all folders (home, ``/``, HERMES_HOME)."""
+    import os
+
+    from tui_gateway import git_probe
+
+    if not os.path.isabs(cwd):
+        return None
+    try:
+        key = git_probe.common_repo_root(cwd) or os.path.realpath(cwd)
+    except Exception:
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = str(get_hermes_home())
+    except Exception:
+        hermes_home = os.path.expanduser("~/.hermes")
+    broad = {os.path.realpath(p) for p in (os.path.expanduser("~"), os.sep, hermes_home)}
+    return None if os.path.realpath(key) in broad else key
+
+
 @method("session.list")
 @_with_db(5006, session_scoped=False)
 def _(rid, params: dict, db) -> dict:
@@ -555,12 +578,21 @@ def _(rid, params: dict, db) -> dict:
         # A store without a path has no profile config to read, so it keeps the default shape.
         db_path = getattr(db, "db_path", None)
         include_subagents = bool(db_path) and show_subagent_sessions(Path(db_path).parent)
+        # ``workspace_cwd`` scopes the listing to one project (cwd at/under its key); compressed
+        # conversations are judged by their root row's cwd. Absent → unchanged response shape.
+        raw_cwd = params.get("workspace_cwd")
+        workspace_cwd = raw_cwd.strip() if isinstance(raw_cwd, str) else ""
+        workspace = _workspace_filter_key(workspace_cwd) if workspace_cwd else None
+        scope = {"cwd_prefix": workspace} if workspace else {}
         rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"),
-                             include_subagents=include_subagents)[:limit]
+                             include_subagents=include_subagents, **scope)[:limit]
         # No live_message_count here on purpose: the bulk listing serves rows whose open
         # paths never demand history (expectHistory defaults false); the count is a
         # per-session scan and would turn one listing call into hundreds of them.
-        return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
+        result = {"sessions": [_session_row_summary(s) for s in rows]}
+        if workspace_cwd:
+            result["workspace"] = workspace
+        return _ok(rid, result)
     except Exception as e:
         return _err(rid, 5006, str(e))
 

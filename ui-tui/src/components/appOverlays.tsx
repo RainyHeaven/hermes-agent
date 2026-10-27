@@ -5,7 +5,7 @@ import type { ReactNode } from 'react'
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppOverlaysProps } from '../app/interfaces.js'
 import { $overlayState, hasFloatingPanel, patchOverlayState } from '../app/overlayStore.js'
-import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
+import { $uiSessionId, $uiState, $uiTheme } from '../app/uiStore.js'
 
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
 import { FloatBox } from './appChrome.js'
@@ -255,6 +255,9 @@ export function FloatingOverlays({
   const overlay = useStore($overlayState)
   const sid = useStore($uiSessionId)
   const theme = useStore($uiTheme)
+  const ui = useStore($uiState)
+  // Same resolution as useMainApp: session cwd, then launcher env, then process cwd.
+  const workspaceCwd = ui.info?.cwd || process.env.HERMES_CWD || process.cwd()
 
   const hasAny = hasFloatingPanel(overlay) || completions.length
 
@@ -292,6 +295,7 @@ export function FloatingOverlays({
             onResume={onResumeSelect}
             onSelect={onActiveSessionSelect}
             t={theme}
+            workspaceCwd={workspaceCwd}
           />
         </FloatBox>
       )
