@@ -3134,6 +3134,7 @@ export interface SessionResumeParams {
   eager_build?: boolean
   close_on_disconnect?: boolean
   inline_images?: boolean
+  cwd?: string | null
 }
 export interface SessionResumeResult {
   session_id: string
@@ -3237,9 +3238,11 @@ export interface SessionListParams {
   title?: string | null
   limit?: number | null
   include_hidden?: boolean
+  workspace_cwd?: string | null
 }
 export interface SessionListResult {
   sessions: SessionListRow[]
+  workspace?: string | null
 }
 /** ``methods_session._session_row_summary``; ``resolved_id`` only on a title lookup that followed a compression lineage to its tip. */
 export interface SessionListRow {
@@ -3265,9 +3268,11 @@ export interface SessionMostRecentResult {
 export interface SessionActiveListParams {
   profile?: string | null
   current_session_id?: string | null
+  workspace_cwd?: string | null
 }
 export interface SessionActiveListResult {
   sessions: SessionActiveItem[]
+  workspace?: string | null
 }
 /** ``server._session_live_item``. */
 export interface SessionActiveItem {

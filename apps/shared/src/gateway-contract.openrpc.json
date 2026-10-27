@@ -29595,6 +29595,18 @@
             ],
             "default": null,
             "title": "Current Session Id"
+          },
+          "workspace_cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Cwd"
           }
         },
         "title": "SessionActiveListParams",
@@ -29609,6 +29621,18 @@
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
           }
         },
         "required": [
@@ -31717,6 +31741,18 @@
             "default": false,
             "title": "Include Hidden",
             "type": "boolean"
+          },
+          "workspace_cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Cwd"
           }
         },
         "title": "SessionListParams",
@@ -31731,6 +31767,18 @@
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace"
           }
         },
         "required": [
@@ -32276,6 +32324,18 @@
             "default": true,
             "title": "Inline Images",
             "type": "boolean"
+          },
+          "cwd": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cwd"
           }
         },
         "required": [

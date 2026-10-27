@@ -192,6 +192,7 @@ class SessionResumeParams(SessionParams):
     # False: render image parts as "[image]" instead of their data URIs — a remote client reads a
     # transcript in kilobytes instead of re-transmitting every stored attachment (#116511).
     inline_images: bool = True
+    cwd: str | None = None  # opening tab's project folder; used only when the stored cwd is empty (FB35)
 
 
 class SessionResumeResult(LiveSessionSnapshot):
@@ -222,6 +223,7 @@ class SessionListParams(ProfileParams):
     title: str | None = None  # exact-title lookup (title as identity); windowless
     limit: int | None = None
     include_hidden: bool = False
+    workspace_cwd: str | None = None  # scope the listing to this folder's project (FB34)
 
 
 class SessionListRow(Result):
@@ -243,6 +245,7 @@ class SessionListRow(Result):
 
 class SessionListResult(Result):
     sessions: list[SessionListRow]
+    workspace: str | None = None  # resolved project key; present only when workspace_cwd was given (FB34)
 
 
 method("session.list", params=SessionListParams, result=SessionListResult,
@@ -266,6 +269,7 @@ method("session.most_recent", params=SessionMostRecentParams, result=SessionMost
 
 class SessionActiveListParams(ProfileParams):
     current_session_id: str | None = None
+    workspace_cwd: str | None = None  # scope the live list to this folder's project (FB35)
 
 
 class SessionActiveItem(Result):
@@ -285,6 +289,7 @@ class SessionActiveItem(Result):
 
 class SessionActiveListResult(Result):
     sessions: list[SessionActiveItem]
+    workspace: str | None = None  # resolved project key; present only when workspace_cwd was given (FB35)
 
 
 method("session.active_list", params=SessionActiveListParams, result=SessionActiveListResult,
