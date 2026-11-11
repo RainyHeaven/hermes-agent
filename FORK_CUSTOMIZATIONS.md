@@ -43,6 +43,16 @@ upstream(NousResearch/hermes-agent) 안정판 태그 위에 얹는 이 포크 �
 - 알려진 한계: 터미널 안에서 `/resume`으로 다른 대화로 옮긴 뒤에도 같은 토큰의 계보 요청은 그 터미널에 붙는다(같은 키 재부착에도 원래 있던 한계). fresh로 연 키(resume 세그먼트 없음)는 대상이 아니다.
 - 제거 조건: upstream에 같은 수정이 들어가면 제거. upstream PR 후보(재현 시험 포함).
 
+### C6. browser_exec 하네스 데몬 유휴 종료
+- 의도: `browser_harness.daemon`은 프로세스 종료 시(`cleanup_all_browsers` → `stop_harness_daemons`)에만 멈춰서, 게이트웨이처럼 오래 사는 프로세스에서는 `BU_NAME`마다 데몬이 계속 쌓이고 비정상 종료 시 고아가 된다(Super-mini 실측 138개, 최대 9일, 약 1.5GB). 마지막 사용 후 일정 시간 쓰지 않은 데몬을, 띄운 프로세스가 죽었어도 살아 있는 아무 Hermes 프로세스가 멈춘다.
+- 동작: `browser_exec` 호출 전후로 `<HERMES_HOME>/cache/browser-use/harness-activity/<name>.json`에 사용 시각을 기록하고, 브라우저 정리 스레드가 고아 정리 주기마다 시간이 지난 이름을 `--reload`로 멈춘 뒤 기록을 지운다. 정리 스레드는 첫 `browser_exec` 때도 시작한다.
+- 설정: `browser.harness_idle_timeout`(초, 기본 1800). env `HERMES_BROWSER_HARNESS_IDLE_TIMEOUT`가 우선. 0 이하면 끔.
+- 새 모듈(충돌 위험 낮음): `tools/browser_harness_idle.py`
+- 코어 연결 지점(충돌 위험 중간): `tools/browser_use_cli.py`(`browser_exec`의 `dispatch()` touch 2곳·정리 스레드 시작, 새 함수 `stop_harness_daemon`), `tools/browser_tool_lifecycle.py`(`_reap_idle_harness_daemons`, `_browser_cleanup_thread_worker` 한 줄)
+- 테스트 격리: `tests/tools/test_browser_use_cli.py`(autouse `_no_cleanup_thread`), `tests/tools/test_browser_use_harness.py`(한 줄)에 정리 스레드 스텁 추가. macOS에서는 정리 스레드의 시작 정리가 실제 `/tmp`를 훑기 때문이다.
+- 확인 테스트: `tests/tools/test_browser_harness_idle.py`
+- 제거 조건: upstream이 유휴 종료를 갖추면 제거.
+
 ## 알려진 환경 의존 실패 (커스텀과 무관)
 
 - `tests/hermes_state/` 의 state_db repair/maintenance 계열 63건은 v0.22.2 + 커스텀 기준선에서도 동일하게 실패한다(2026-10-22, 이 기기·test-venv). 버전업 검증에서는 실패 ID 집합을 기준선 clone과 비교해 새 실패만 본다.

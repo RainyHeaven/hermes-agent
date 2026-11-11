@@ -39,6 +39,7 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
     monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
     monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", lambda: None)
     monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: False)
+    monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
     def local_browser(task_id, command, args, **kwargs):
         assert (task_id, command, args) == ("bu-named-research", "get", ["cdp-url"])
         return {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:47000/private"}}

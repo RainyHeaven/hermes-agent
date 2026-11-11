@@ -37,6 +37,12 @@ def _clean_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_cleanup_thread(monkeypatch):
+    """browser_exec starts the browser janitor; its startup reap scans the host tmp dir."""
+    monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _fake_managed_chromium(monkeypatch):
     """The local-engine route asks agent-browser for the packaged Chromium's CDP url; never launch
     a real browser from a unit test. Records every ``get cdp-url`` session key in ``.calls``."""

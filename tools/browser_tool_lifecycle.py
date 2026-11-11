@@ -412,6 +412,12 @@ def _reap_orphaned_browser_sessions():
         _bt.logger.info("Reaped %d orphaned browser session(s) from previous run(s)", reaped)
 
 
+def _reap_idle_harness_daemons() -> None:
+    from tools import browser_harness_idle
+    from tools.browser_use_cli import stop_harness_daemon
+    browser_harness_idle.reap_idle(stop_harness_daemon)
+
+
 def _browser_cleanup_thread_worker():
     """Every 30s: close sessions idle past BROWSER_SESSION_INACTIVITY_TIMEOUT; reap
     orphans on startup AND every BROWSER_ORPHAN_REAP_INTERVAL seconds."""
@@ -424,6 +430,7 @@ def _browser_cleanup_thread_worker():
                 _reap_orphaned_browser_sessions()
             except Exception as e:
                 _bt.logger.warning("Orphan reap error: %s", e)
+            _best_effort("Idle harness daemon reap", _reap_idle_harness_daemons)
         cycle += 1
 
         try:

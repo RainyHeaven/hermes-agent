@@ -690,6 +690,17 @@ def stop_harness_daemons() -> None:
             _run_cli_killing_process_group([*cmd, "--reload"], "", {**env, "BU_NAME": name}, 15)
 
 
+def stop_harness_daemon(name: str) -> None:
+    """Stop one harness daemon the same way, whichever process drove it (idle reaper, C6)."""
+    with _driven_daemons_lock:
+        _driven_daemons.discard(name)
+    cmd = _find_cli()
+    if not cmd:
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        _run_cli_killing_process_group([*cmd, "--reload"], "", {**_base_subprocess_env(), "BU_NAME": name}, 15)
+
+
 def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT_S,
                  task_id: Optional[str] = None, local: bool = False):
     """Run Python code through the browser-use CLI, and return its output"""
@@ -746,9 +757,14 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     started = time.time()
 
     def dispatch() -> dict[str, Any]:
+        from tools import browser_harness_idle
+        from tools.browser_tool_lifecycle import _start_browser_cleanup_thread
         _attach_vault_supervisor(env, task_id)
+        daemon_name = env.get("BU_NAME", "default")
         with _driven_daemons_lock:
-            _driven_daemons.add(env.get("BU_NAME", "default"))
+            _driven_daemons.add(daemon_name)
+        browser_harness_idle.touch(daemon_name)
+        _start_browser_cleanup_thread()  # runs the idle reaper; until now only legacy sessions started it
         try:
             return {"proc": _run_cli_killing_process_group(cmd, code, env, timeout)}
         except subprocess.TimeoutExpired:
@@ -759,6 +775,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
             )}
         except OSError as e:
             return {"error_result": tool_error(f"Failed to launch browser-use CLI: {e}")}
+        finally:
+            browser_harness_idle.touch(daemon_name)  # a long call must not look idle the moment it returns
 
     if bot_desktop_browser:
         from tools.browser_tool_session import run_fenced
